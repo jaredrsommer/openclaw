@@ -140,6 +140,8 @@
       "maxLocalConcurrency": 2,
       "tier": "auto",
       "dashboardPort": 3939,
+      "qwenOAuth": true,
+      "_comment_qwen": "Free 1000-2000 req/day via Qwen OAuth. Run 'apexclaw-trade action:qwen-auth' to set up.",
 
       "_comment_howto": [
         "Pick ONE fleetNodes config below based on how many GPU machines you have.",

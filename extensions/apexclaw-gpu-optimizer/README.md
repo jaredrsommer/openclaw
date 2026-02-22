@@ -117,8 +117,8 @@ Real-time monitoring at `http://<dashboard-host>:3939`:
 | Anomaly detection | Local | Custom Qwen3 MoE (GPU) | Trading-specific patterns |
 | Order generation | Local | Custom Qwen3 MoE (GPU) | Structured output, trading formats |
 | RBI backtest | Local | CPU (128GB MoE machine) | RAM + CPU intensive, not GPU |
-| RBI research | Free API | NVIDIA Nemotron 70B | Deep analysis, free |
-| RBI implementation | Free API | NVIDIA 70B | Robust code gen, free |
+| RBI research | Free API | Qwen3-Coder-Plus (OAuth) | Best free coding model, 1K-2K/day |
+| RBI implementation | Free API | Qwen3-Coder-Plus (OAuth) | Best free coding model |
 | Polymarket analysis | Free API | NVIDIA 70B | Complex reasoning, free |
 | Market summary | Free API | NVIDIA Nemotron 70B | Large context, free |
 | Risk assessment | Paid API | Claude Sonnet | Critical decisions need best reasoning |
@@ -188,13 +188,39 @@ NODE_ROLE=queen ./setup-fleet.sh
 
 Move the dashboard and API-backed agents (risk, polymarket) off the MoE machine.
 
+### Step 5: Enable Qwen OAuth (Free Cloud Coding Model)
+
+Get 1,000-2,000 free coding API requests per day from your Qwen account — no GPU or API key needed. This gives you `qwen3-coder-plus` (Alibaba's best coding model) for RBI research, backtest code gen, and implementation.
+
+```bash
+# Option A: Authenticate through OpenClaw
+apexclaw-trade action:qwen-auth
+
+# Option B: Authenticate via Qwen Code CLI first (token is shared)
+npm install -g @qwen-code/qwen-code
+qwen  # follow the browser auth prompt — one-time setup
+```
+
+The OAuth token is stored at `~/.qwen/oauth_creds.json` and auto-refreshes. Once authenticated, code gen tasks automatically route to `qwen3-coder-plus` instead of NVIDIA NIM or local models.
+
+Add to your config to enable:
+```json
+{
+  "qwenOAuth": true
+}
+```
+Or set `QWEN_OAUTH_ENABLED=1` in your environment.
+
+**Why this matters:** With the 2-node starter (MoE + Coder), Qwen OAuth can potentially replace the Coder machine entirely for code gen tasks. The cloud `qwen3-coder-plus` is a much larger model than the local 7B — you get better code quality for free.
+
 ### Starting the System
 
 ```
-apexclaw-trade action:start    → starts orchestrator + dashboard
-apexclaw-trade action:status   → full fleet + agent snapshot
+apexclaw-trade action:start     → starts orchestrator + dashboard
+apexclaw-trade action:status    → full fleet + agent snapshot
 apexclaw-trade action:dashboard → dashboard URL
-apexclaw-trade action:stop     → graceful shutdown
+apexclaw-trade action:stop      → graceful shutdown
+apexclaw-trade action:qwen-auth → authenticate Qwen OAuth
 ```
 
 ### Custom Qwen3 MoE Setup
@@ -223,6 +249,19 @@ Key vLLM flags for 8GB VRAM:
 - `--max-num-seqs 1` — Single request at a time
 
 ## Free API Setup
+
+### Qwen OAuth (Recommended — Best Free Coding Model)
+
+1,000-2,000 free requests/day with `qwen3-coder-plus` — Alibaba's best coding model.
+No API key needed, just a free qwen.ai account.
+
+1. Run `apexclaw-trade action:qwen-auth` and follow the browser prompt
+2. Or install `@qwen-code/qwen-code` and run `qwen` to authenticate
+3. Token saved to `~/.qwen/oauth_creds.json` (auto-refreshes)
+4. Set `"qwenOAuth": true` in your plugin config or `QWEN_OAUTH_ENABLED=1`
+
+The router automatically prefers Qwen for code gen tasks (RBI research, implement, backtest).
+Falls back to NVIDIA NIM or local models if Qwen quota is exhausted.
 
 ### NVIDIA NIM (Free Tier)
 
@@ -309,9 +348,9 @@ See `apexclaw.config.example.json` for 1/2/3/4-node configs. The active config u
 | Liquidation Detector | MoE CPU → Sentinel GPU | Continuous | Local (3B) |
 | Sentiment Analyzer | MoE GPU (always) | Every 15min | Local (Qwen3 MoE) |
 | Anomaly Hunter | MoE GPU (always) | Every 4h | Local (Qwen3 MoE) |
-| RBI Researcher | APIs → Coder GPU | On-demand | Free API (NVIDIA 70B) |
+| RBI Researcher | APIs → Coder GPU | On-demand | Free API (Qwen3-Coder-Plus) |
 | RBI Backtester | MoE CPU (always) | On-demand | Local (128GB RAM) |
-| RBI Implementer | APIs → Coder GPU | On-demand | Free API (NVIDIA 70B) |
+| RBI Implementer | APIs → Coder GPU | On-demand | Free API (Qwen3-Coder-Plus) |
 | Risk Manager | APIs (always) | Every 5min | Paid API (Claude) |
 | Polymarket Analyst | APIs (always) | Every 30min | Free API (NVIDIA 70B) |
 

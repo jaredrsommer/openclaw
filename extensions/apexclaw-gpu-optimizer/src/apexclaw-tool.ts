@@ -15,6 +15,7 @@ import { FleetManager, DEFAULT_FLEET_CONFIG, type FleetConfig } from "./fleet-ma
 import { QueenOrchestrator } from "./queen-orchestrator.js";
 import { startDashboardServer } from "./dashboard-server.js";
 import { RemoteFleetClient, discoverQueenNode } from "./remote-client.js";
+import { QwenOAuthProvider } from "./qwen-oauth-provider.js";
 
 type PluginCfg = {
   gpuVramMb?: number;
@@ -31,7 +32,12 @@ type PluginCfg = {
   remoteQueenHost?: string;
   /** "local" = this machine runs agents. "remote" = this is a laptop/control node. "auto" = detect. */
   mode?: "local" | "remote" | "auto";
+  /** Enable Qwen OAuth for free cloud coding model (1000-2000 req/day) */
+  qwenOAuth?: boolean;
 };
+
+// Singleton for Qwen OAuth provider
+let qwenProvider: QwenOAuthProvider | null = null;
 
 function buildRouterConfig(cfg: PluginCfg): RouterConfig {
   return {
@@ -41,6 +47,7 @@ function buildRouterConfig(cfg: PluginCfg): RouterConfig {
     hasNvidiaApi: Boolean(cfg.nvidiaApiKey || process.env.NVIDIA_API_KEY),
     hasGrokApi: Boolean(cfg.grokApiKey || process.env.XAI_API_KEY || process.env.GROK_API_KEY),
     hasClaudeApi: Boolean(process.env.ANTHROPIC_API_KEY),
+    hasQwenOAuth: Boolean(cfg.qwenOAuth || process.env.QWEN_OAUTH_ENABLED || qwenProvider?.isAuthenticated()),
     forceTier: cfg.tier === "local" || cfg.tier === "free-api" || cfg.tier === "paid-api"
       ? cfg.tier
       : undefined,
@@ -60,11 +67,11 @@ export function createApexClawTool(api: OpenClawPluginApi) {
     name: "apexclaw-trade",
     label: "ApexClaw Trading Router",
     description:
-      "GPU-optimized trading agent router for 4x GTX 1070 Ti fleet. Routes tasks across local GPU models (Ollama/vLLM), free APIs (NVIDIA NIM, Grok), and paid APIs (Claude Max). Includes dashboard, RBI pipeline, liquidation detection, sentiment analysis, and risk management.",
+      "GPU-optimized trading agent router for 1-4 node fleet. Routes tasks across local GPU models (Ollama/vLLM), free APIs (Qwen OAuth, NVIDIA NIM, Grok), and paid APIs (Claude Max). Includes dashboard, RBI pipeline, liquidation detection, sentiment analysis, and risk management.",
     parameters: Type.Object({
       action: Type.String({
         description:
-          'Action: "route" (route a task), "agents" (list agents), "status" (fleet status), "gpu-info" (show GPU models), "cost-estimate" (monthly cost estimate), "dashboard" (start dashboard), "start" (start orchestrator), "stop" (stop orchestrator)',
+          'Action: "route" (route a task), "agents" (list agents), "status" (fleet status), "gpu-info" (show GPU models), "cost-estimate" (monthly cost estimate), "dashboard" (start dashboard), "start" (start orchestrator), "stop" (stop orchestrator), "qwen-auth" (authenticate Qwen OAuth for free cloud coding model)',
       }),
       taskType: Type.Optional(
         Type.String({
@@ -333,11 +340,83 @@ export function createApexClawTool(api: OpenClawPluginApi) {
           };
         }
 
+        case "qwen-auth": {
+          if (!qwenProvider) {
+            qwenProvider = new QwenOAuthProvider();
+          }
+
+          // Try to load existing credentials first
+          const alreadyAuth = await qwenProvider.initialize();
+          if (alreadyAuth) {
+            const stats = qwenProvider.getStats();
+            return {
+              content: [{
+                type: "text",
+                text: [
+                  "Qwen OAuth: Already authenticated!",
+                  "",
+                  `Remaining today: ${stats.remainingDaily} / ${950} requests`,
+                  `Token expires: ${stats.tokenExpiresAt ? new Date(stats.tokenExpiresAt * 1000).toISOString() : "unknown"}`,
+                  "",
+                  "Qwen cloud models (qwen3-coder-plus, qwen3-max) will be used",
+                  "for code gen tasks (RBI research, backtest, implement) in the free-api tier.",
+                  "",
+                  'Set QWEN_OAUTH_ENABLED=1 or "qwenOAuth": true in your config to enable.',
+                ].join("\n"),
+              }],
+            };
+          }
+
+          // Need to run Device Flow
+          const result = await qwenProvider.authenticate();
+          if (result.success) {
+            return {
+              content: [{
+                type: "text",
+                text: [
+                  "Qwen OAuth: Authenticated successfully!",
+                  "",
+                  "Credentials saved to ~/.qwen/oauth_creds.json",
+                  "(shared with Qwen Code CLI — tokens auto-refresh)",
+                  "",
+                  "Free tier: 1,000-2,000 requests/day, 60/min",
+                  "Models: qwen3-coder-plus, qwen3-coder-flash, qwen3-max",
+                  "",
+                  "Code gen tasks will now route to Qwen cloud instead of NVIDIA/local.",
+                ].join("\n"),
+              }],
+            };
+          }
+
+          return {
+            content: [{
+              type: "text",
+              text: [
+                "Qwen OAuth: Authentication required.",
+                "",
+                result.verificationUrl
+                  ? `Open this URL in your browser: ${result.verificationUrl}`
+                  : "Open https://chat.qwen.ai to authorize.",
+                result.userCode ? `Enter code: ${result.userCode}` : "",
+                "",
+                "After authorizing, run this action again.",
+                "",
+                "Or authenticate via the Qwen Code CLI first:",
+                "  npm install -g @qwen-code/qwen-code",
+                "  qwen  # follow browser auth prompt",
+                "",
+                "The token at ~/.qwen/oauth_creds.json is shared — auth once, use everywhere.",
+                result.error ? `\nError: ${result.error}` : "",
+              ].filter(Boolean).join("\n"),
+            }],
+          };
+        }
+
         default:
           return {
             content: [{
               type: "text",
-              text: `Unknown action "${action}". Available: start, stop, status, dashboard, route, agents, gpu-info, cost-estimate`,
+              text: `Unknown action "${action}". Available: start, stop, status, dashboard, route, agents, gpu-info, cost-estimate, qwen-auth`,
             }],
           };
       }

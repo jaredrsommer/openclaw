@@ -546,6 +546,7 @@ export class FleetManager {
       hasNvidiaApi: Boolean(process.env.NVIDIA_API_KEY),
       hasGrokApi: Boolean(process.env.XAI_API_KEY || process.env.GROK_API_KEY),
       hasClaudeApi: Boolean(process.env.ANTHROPIC_API_KEY),
+      hasQwenOAuth: Boolean(process.env.QWEN_OAUTH_ENABLED),
       maxLocalConcurrency: targetNode.maxConcurrency,
       currentLocalLoad: targetNode.currentLoad,
       customQwenAvailable: targetNode.hasCustomQwen,

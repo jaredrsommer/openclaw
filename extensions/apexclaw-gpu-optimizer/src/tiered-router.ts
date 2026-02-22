@@ -5,11 +5,14 @@
  * cost sensitivity, and latency requirements:
  *
  *   Tier 1 (Local GPU) → Ollama/vLLM on 1070 Ti — free, ~2-10 tok/s
- *   Tier 2 (Free APIs)  → NVIDIA NIM, Grok free — free, ~30-80 tok/s
+ *   Tier 2 (Free APIs)  → Qwen OAuth, NVIDIA NIM, Grok free — free, ~30-80 tok/s
  *   Tier 3 (Paid APIs)  → Claude Max, Grok Pro  — paid, ~60-120 tok/s
  *
  * Trading-specific routing prioritizes speed for time-sensitive decisions
  * (liquidation sniping, order execution) and cost for background analysis.
+ *
+ * Qwen OAuth (qwen3-coder-plus) is preferred for code gen tasks in the
+ * free-api tier — 1,000-2,000 free requests/day from your Qwen account.
  */
 
 export type InferenceTier = "local" | "free-api" | "paid-api";
@@ -49,6 +52,8 @@ export type RouterConfig = {
   hasNvidiaApi: boolean;
   hasGrokApi: boolean;
   hasClaudeApi: boolean;
+  /** Qwen OAuth authenticated (qwen3-coder-plus, 1000-2000 free/day) */
+  hasQwenOAuth: boolean;
   forceTier?: InferenceTier;
   maxLocalConcurrency: number;
   currentLocalLoad: number;
@@ -79,6 +84,16 @@ export const TIER_PROVIDERS = {
     },
   },
   "free-api": {
+    qwen: {
+      // Qwen OAuth free tier (1,000-2,000 req/day via qwen.ai account)
+      // Preferred for code gen tasks — best free coding model available
+      models: {
+        code: "qwen3-coder-plus",
+        codeFast: "qwen3-coder-flash",
+        general: "qwen3-max",
+        latest: "qwen-plus-latest",
+      },
+    },
     nvidia: {
       // NVIDIA NIM free tier
       models: {
@@ -321,12 +336,45 @@ function resolveLocalProvider(
   };
 }
 
+/** Code-related task types that benefit from Qwen's coding model */
+const CODE_TASKS: TradingTaskType[] = [
+  "rbi-research", "rbi-backtest", "rbi-implement",
+];
+
 function resolveFreeApiProvider(
   taskType: TradingTaskType,
   route: (typeof TRADING_ROUTES)[TradingTaskType],
   config: RouterConfig,
 ): RouteDecision {
-  // Prefer NVIDIA NIM for larger context tasks
+  // Prefer Qwen OAuth for code-related tasks (best free coding model)
+  // qwen3-coder-plus: 1,000-2,000 free req/day via OAuth
+  if (config.hasQwenOAuth && CODE_TASKS.includes(taskType)) {
+    const needsFast = route.urgency === "realtime" || route.urgency === "urgent";
+    return {
+      tier: "free-api",
+      provider: "qwen",
+      model: needsFast
+        ? TIER_PROVIDERS["free-api"].qwen.models.codeFast
+        : TIER_PROVIDERS["free-api"].qwen.models.code,
+      reason: `Qwen OAuth free: ${route.reason}`,
+      estimatedCostUsd: 0,
+      estimatedLatencyMs: needsFast ? 600 : 1500,
+    };
+  }
+
+  // Qwen OAuth for general tasks when NVIDIA isn't available
+  if (config.hasQwenOAuth && !config.hasNvidiaApi) {
+    return {
+      tier: "free-api",
+      provider: "qwen",
+      model: TIER_PROVIDERS["free-api"].qwen.models.general,
+      reason: `Qwen OAuth free: ${route.reason}`,
+      estimatedCostUsd: 0,
+      estimatedLatencyMs: 1500,
+    };
+  }
+
+  // NVIDIA NIM for larger context / general tasks
   if (config.hasNvidiaApi) {
     const needsFast = route.urgency === "realtime" || route.urgency === "urgent";
     const model = needsFast
@@ -343,13 +391,25 @@ function resolveFreeApiProvider(
     };
   }
 
-  // Fall back to Grok free tier
+  // Grok free tier
   if (config.hasGrokApi) {
     return {
       tier: "free-api",
       provider: "grok",
       model: TIER_PROVIDERS["free-api"].grok.models.general,
       reason: `Grok free tier: ${route.reason}`,
+      estimatedCostUsd: 0,
+      estimatedLatencyMs: 1500,
+    };
+  }
+
+  // Qwen OAuth as last free resort (even for non-code tasks)
+  if (config.hasQwenOAuth) {
+    return {
+      tier: "free-api",
+      provider: "qwen",
+      model: TIER_PROVIDERS["free-api"].qwen.models.latest,
+      reason: `Qwen OAuth free (fallback): ${route.reason}`,
       estimatedCostUsd: 0,
       estimatedLatencyMs: 1500,
     };
