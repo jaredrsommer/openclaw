@@ -1,24 +1,19 @@
 /**
- * Fleet manager for distributing agents across multiple low-end GPU nodes.
+ * Fleet manager for distributing agents across 1-4 low-end GPU nodes.
  *
- * Manages a fleet of 4x GTX 1070 Ti (8GB each) machines, each running
- * Ollama + optional custom Qwen3 MoE via vLLM. Distributes agent workloads
- * based on node capabilities, current load, and task requirements.
+ * Scales progressively from a single MoE machine to a full 4-node fleet.
+ * The MoE machine (128GB DDR4, Ryzen 5900X, GTX 1070 Ti) is always the anchor:
  *
- * 4-Node Architecture (mirrors MoonDev's 6-OpenClaw setup with 4 GPUs):
+ *   1-Node:  MoE does everything. vLLM on GPU, Ollama 3B on CPU, APIs for overflow.
+ *   2-Node:  MoE + Coder. Offload code gen (RBI research/implement) to second GPU.
+ *   3-Node:  MoE + Coder + Sentinel. Dedicated fast 3B classification GPU.
+ *   4-Node:  MoE + Coder + Sentinel + Queen. Dedicated dashboard/orchestration node.
  *
- *   Node 1 "Sentinel"  — Real-time feeds: Stream Observer + Liquidation Detector + Signal Classifier
- *                         Loads: Qwen 3B (always hot) for lowest latency
- *
- *   Node 2 "Strategist" — Custom Qwen3 MoE via vLLM: Sentiment + Anomaly + Order Generation
- *                         Loads: Your trading-trained MoE model
- *
- *   Node 3 "Coder"      — RBI pipeline: Backtest code gen + implementation assist
- *                         Loads: Qwen Coder 7B / DeepSeek R1 7B
- *
- *   Node 4 "Queen"       — Orchestrator: Risk Manager + Queen supervisor + dashboard host
- *                         Loads: Qwen 7B general + coordinates API calls to Claude/Grok/NVIDIA
- *                         Runs the dashboard web server
+ * Key design decisions:
+ *   - Backtesting ALWAYS runs on MoE machine (best CPU + 128GB RAM)
+ *   - Risk/Polymarket/Research use paid/free APIs — no GPU needed
+ *   - vLLM owns the GPU on the MoE machine; Ollama runs 3B on CPU (128GB makes this viable)
+ *   - Each added node frees the MoE machine to focus on trading inference
  */
 
 import type { AgentTemplate } from "./trading-agents.js";
@@ -83,18 +78,152 @@ export type FleetConfig = {
 };
 
 /**
- * Default fleet configuration for a 4-node GTX 1070 Ti cluster.
- * Each node has a dedicated purpose — no model swapping needed.
+ * Fleet presets for progressive scaling.
+ *
+ * The MoE machine (128GB DDR4, Ryzen 5900X, GTX 1070 Ti) is always the anchor:
+ *   - vLLM holds custom Qwen3 MoE on GPU (~6-7GB VRAM)
+ *   - Ollama runs Qwen 3B on CPU (128GB RAM makes this fast enough)
+ *   - Backtesting always runs here (best CPU + most RAM)
+ *   - Hosts the dashboard until a dedicated Queen node is added
+ *
+ * Non-GPU roles (risk, research, polymarket) are handled by free/paid APIs
+ * regardless of how many nodes you have — no GPU needed for those.
  */
-export const DEFAULT_FLEET_CONFIG: FleetConfig = {
+
+/**
+ * 1-Node: Just the MoE machine.
+ *   GPU: Custom Qwen3 MoE via vLLM (trading inference)
+ *   CPU: Qwen 3B via Ollama (fast classification — 128GB RAM handles this)
+ *   APIs: NVIDIA NIM for research, Claude for risk, Grok for overflow
+ *   Backtesting: Runs locally (best CPU/RAM in the fleet)
+ *   Dashboard: Hosted here
+ */
+export const FLEET_1NODE: FleetConfig = {
+  healthCheckIntervalMs: 30000,
+  healthCheckTimeoutMs: 5000,
+  dashboardPort: 3939,
+  nodes: [
+    {
+      id: "node-1-moe",
+      name: "MoE (All-in-One)",
+      host: "192.168.1.101",
+      ollamaPort: 11434,
+      vllmPort: 8000,
+      gpuVramMb: 8192,
+      role: "strategist",
+      hasCustomQwen: true,
+      maxConcurrency: 2,
+      assignedAgents: [
+        // Local GPU (MoE): trading inference
+        "sentiment-analyzer", "anomaly-hunter",
+        // Local CPU (3B): fast classification
+        "stream-observer", "signal-classifier", "liquidation-detector",
+        // Local CPU: backtesting (128GB RAM, 5900X)
+        "rbi-backtester",
+        // API-backed: no local GPU needed
+        "risk-manager", "polymarket-analyst", "rbi-researcher", "rbi-implementer",
+      ],
+      isDashboardHost: true,
+    },
+  ],
+};
+
+/**
+ * 2-Node (recommended starter): MoE machine + Coder machine.
+ *   Node 1 (MoE, 128GB/5900X): Trading inference + backtesting + dashboard
+ *   Node 2 (Coder):             Code gen models (Qwen Coder 7B, DeepSeek R1 7B)
+ *   Sentinel tasks:             Handled by 3B on MoE CPU or free APIs
+ *   Risk/Polymarket:            Handled by paid/free APIs (no GPU needed)
+ */
+export const FLEET_2NODE: FleetConfig = {
   healthCheckIntervalMs: 15000,
   healthCheckTimeoutMs: 5000,
   dashboardPort: 3939,
   nodes: [
     {
-      id: "node-1-sentinel",
-      name: "Sentinel",
+      id: "node-1-moe",
+      name: "MoE (Strategist+Queen)",
       host: "192.168.1.101",
+      ollamaPort: 11434,
+      vllmPort: 8000,
+      gpuVramMb: 8192,
+      role: "strategist",
+      hasCustomQwen: true,
+      maxConcurrency: 2,
+      assignedAgents: [
+        // Local GPU (MoE): trading inference
+        "sentiment-analyzer", "anomaly-hunter",
+        // Local CPU (3B): fast classification
+        "stream-observer", "signal-classifier", "liquidation-detector",
+        // Local CPU: backtesting (128GB RAM, 5900X)
+        "rbi-backtester",
+        // API-backed: risk + polymarket
+        "risk-manager", "polymarket-analyst",
+      ],
+      isDashboardHost: true,
+    },
+    {
+      id: "node-2-coder",
+      name: "Coder",
+      host: "192.168.1.102",
+      ollamaPort: 11434,
+      vllmPort: 8000,
+      gpuVramMb: 8192,
+      role: "coder",
+      hasCustomQwen: false,
+      maxConcurrency: 1,
+      assignedAgents: ["rbi-researcher", "rbi-implementer"],
+      isDashboardHost: false,
+    },
+  ],
+};
+
+/**
+ * 3-Node: MoE + Coder + Sentinel.
+ *   Node 1 (MoE, 128GB/5900X): Trading inference + backtesting + dashboard
+ *   Node 2 (Coder):             RBI code gen (Qwen Coder 7B, DeepSeek R1)
+ *   Node 3 (Sentinel):          Fast 3B classification on dedicated GPU
+ *   Risk/Polymarket:            Still API-backed
+ */
+export const FLEET_3NODE: FleetConfig = {
+  healthCheckIntervalMs: 15000,
+  healthCheckTimeoutMs: 5000,
+  dashboardPort: 3939,
+  nodes: [
+    {
+      id: "node-1-moe",
+      name: "MoE (Strategist+Queen)",
+      host: "192.168.1.101",
+      ollamaPort: 11434,
+      vllmPort: 8000,
+      gpuVramMb: 8192,
+      role: "strategist",
+      hasCustomQwen: true,
+      maxConcurrency: 2,
+      assignedAgents: [
+        "sentiment-analyzer", "anomaly-hunter",
+        "rbi-backtester",
+        "risk-manager", "polymarket-analyst",
+      ],
+      isDashboardHost: true,
+    },
+    {
+      id: "node-2-coder",
+      name: "Coder",
+      host: "192.168.1.102",
+      ollamaPort: 11434,
+      vllmPort: 8000,
+      gpuVramMb: 8192,
+      role: "coder",
+      hasCustomQwen: false,
+      maxConcurrency: 1,
+      assignedAgents: ["rbi-researcher", "rbi-implementer"],
+      isDashboardHost: false,
+    },
+    {
+      id: "node-3-sentinel",
+      name: "Sentinel",
+      host: "192.168.1.103",
       ollamaPort: 11434,
       vllmPort: 8000,
       gpuVramMb: 8192,
@@ -104,30 +233,58 @@ export const DEFAULT_FLEET_CONFIG: FleetConfig = {
       assignedAgents: ["stream-observer", "signal-classifier", "liquidation-detector"],
       isDashboardHost: false,
     },
+  ],
+};
+
+/**
+ * 4-Node: Full fleet with dedicated Queen.
+ *   Node 1 (MoE, 128GB/5900X): Trading inference + backtesting (dedicated)
+ *   Node 2 (Coder):             RBI code gen
+ *   Node 3 (Sentinel):          Fast 3B classification
+ *   Node 4 (Queen):             Dashboard + orchestration + API gateway
+ */
+export const FLEET_4NODE: FleetConfig = {
+  healthCheckIntervalMs: 15000,
+  healthCheckTimeoutMs: 5000,
+  dashboardPort: 3939,
+  nodes: [
     {
-      id: "node-2-strategist",
-      name: "Strategist",
-      host: "192.168.1.102",
+      id: "node-1-moe",
+      name: "MoE (Strategist)",
+      host: "192.168.1.101",
       ollamaPort: 11434,
       vllmPort: 8000,
       gpuVramMb: 8192,
       role: "strategist",
       hasCustomQwen: true,
-      maxConcurrency: 1,
-      assignedAgents: ["sentiment-analyzer", "anomaly-hunter"],
+      maxConcurrency: 2,
+      assignedAgents: ["sentiment-analyzer", "anomaly-hunter", "rbi-backtester"],
       isDashboardHost: false,
     },
     {
-      id: "node-3-coder",
+      id: "node-2-coder",
       name: "Coder",
-      host: "192.168.1.103",
+      host: "192.168.1.102",
       ollamaPort: 11434,
       vllmPort: 8000,
       gpuVramMb: 8192,
       role: "coder",
       hasCustomQwen: false,
       maxConcurrency: 1,
-      assignedAgents: ["rbi-researcher", "rbi-backtester", "rbi-implementer"],
+      assignedAgents: ["rbi-researcher", "rbi-implementer"],
+      isDashboardHost: false,
+    },
+    {
+      id: "node-3-sentinel",
+      name: "Sentinel",
+      host: "192.168.1.103",
+      ollamaPort: 11434,
+      vllmPort: 8000,
+      gpuVramMb: 8192,
+      role: "sentinel",
+      hasCustomQwen: false,
+      maxConcurrency: 2,
+      assignedAgents: ["stream-observer", "signal-classifier", "liquidation-detector"],
       isDashboardHost: false,
     },
     {
@@ -145,6 +302,19 @@ export const DEFAULT_FLEET_CONFIG: FleetConfig = {
     },
   ],
 };
+
+/** Default fleet config — 2-node starter (recommended) */
+export const DEFAULT_FLEET_CONFIG: FleetConfig = FLEET_2NODE;
+
+/** Helper to get a fleet preset by node count */
+export function getFleetPreset(nodeCount: 1 | 2 | 3 | 4): FleetConfig {
+  switch (nodeCount) {
+    case 1: return FLEET_1NODE;
+    case 2: return FLEET_2NODE;
+    case 3: return FLEET_3NODE;
+    case 4: return FLEET_4NODE;
+  }
+}
 
 /** Event types emitted by the fleet manager for the dashboard */
 export type FleetEvent =

@@ -2,65 +2,104 @@
 
 GPU-optimized trading agent framework for OpenClaw, designed to run on low-end GPUs (8GB VRAM, e.g. GTX 1070 Ti) with a multi-tier inference strategy and a real-time monitoring dashboard.
 
-## Architecture: 4-Node Fleet
+## Architecture: MoE Machine + Scale as You Go
 
-Inspired by MoonDev's multi-OpenClaw setup, but purpose-built for 4x GTX 1070 Ti machines with dedicated roles:
+The **MoE machine** (128GB DDR4, Ryzen 5900X, GTX 1070 Ti) is always the anchor. It runs your custom Qwen3 MoE on GPU via vLLM, handles backtesting (best CPU + most RAM), and hosts the dashboard. Free/paid APIs fill in the gaps — no GPU needed for risk assessment, research, or polymarket analysis.
 
-```
-  ┌─────────────────────────────────────────────────────────────────┐
-  │                     QUEEN ORCHESTRATOR                          │
-  │            (Node 4 — coordinates everything)                    │
-  │                                                                 │
-  │  ┌─────────┐  ┌─────────────┐  ┌──────────┐  ┌─────────────┐  │
-  │  │Dashboard │  │Risk Manager │  │Polymarket│  │ API Gateway  │  │
-  │  │ :3939    │  │(Claude Max) │  │ Analyst  │  │Claude/Grok/NV│  │
-  │  └─────────┘  └─────────────┘  └──────────┘  └─────────────┘  │
-  └───────────────────────┬─────────────────────────────────────────┘
-                          │
-        ┌─────────────────┼─────────────────┐
-        │                 │                 │
-  ┌─────▼─────┐   ┌──────▼──────┐   ┌──────▼──────┐
-  │  SENTINEL  │   │ STRATEGIST  │   │   CODER     │
-  │  (Node 1)  │   │  (Node 2)   │   │  (Node 3)   │
-  │            │   │             │   │             │
-  │ Stream     │   │ Qwen3 MoE   │   │ Qwen Coder  │
-  │ Observer   │   │ (trading)   │   │ 7B          │
-  │ Signal     │   │             │   │             │
-  │ Classifier │   │ Sentiment   │   │ RBI         │
-  │ Liquidation│   │ Anomaly     │   │ Research    │
-  │ Detector   │   │ Hunter      │   │ Backtest    │
-  │            │   │             │   │ Implement   │
-  │ Qwen 3B   │   │ Custom MoE  │   │ DeepSeek R1 │
-  │ (fast)     │   │ via vLLM    │   │ 7B          │
-  └────────────┘   └─────────────┘   └─────────────┘
-```
+Start with what you have. Add GPU machines as they become available.
 
-### Scale as you go: 2-node starter
+### 1-Node: Just the MoE Machine
 
-**Don't have all 4 machines yet?** Start with 2 — the system adapts:
+Everything runs on one box. vLLM owns the GPU for your MoE model, Ollama runs Qwen 3B on CPU (128GB RAM makes this viable). APIs handle research, risk, and overflow.
 
 ```
-  ┌──────────────────┐    ┌──────────────────┐
-  │ Node 1: Sentinel │    │ Node 2: Queen    │
-  │ + Strategist     │    │ + Coder          │
-  │                  │    │                  │
-  │ Stream Observer  │    │ Risk Manager     │
-  │ Signal Classifier│    │ Polymarket       │
-  │ Liquidation Det. │    │ RBI Pipeline     │
-  │ Sentiment        │    │ Dashboard :3939  │
-  │ Anomaly Hunter   │    │                  │
-  │                  │    │ Qwen 7B / Coder  │
-  │ Qwen 3B + MoE   │    │ + API calls      │
-  └──────────────────┘    └──────────────────┘
+  ┌────────────────────────────────────────────────────┐
+  │              MOE MACHINE (128GB / 5900X)            │
+  │                                                    │
+  │  GPU (1070 Ti)         CPU (5900X 12c/24t)         │
+  │  ┌──────────────┐     ┌────────────────────────┐   │
+  │  │ vLLM         │     │ Ollama (CPU mode)      │   │
+  │  │ Custom Qwen3 │     │ Qwen 3B classification │   │
+  │  │ MoE Trading  │     ├────────────────────────┤   │
+  │  │              │     │ Backtesting engine     │   │
+  │  │ Sentiment    │     │ (128GB RAM for data)   │   │
+  │  │ Anomaly Det. │     ├────────────────────────┤   │
+  │  │ Order Gen    │     │ Dashboard :3939        │   │
+  │  └──────────────┘     └────────────────────────┘   │
+  │                                                    │
+  │  APIs: Risk (Claude) · Research (NVIDIA) · Grok    │
+  └────────────────────────────────────────────────────┘
 ```
 
-Agents from missing nodes get reassigned to available ones. The free API tier (NVIDIA NIM, Grok) absorbs overflow from busy local GPUs.
+### 2-Node: MoE + Coder (Recommended Starter)
+
+Add a second GPU machine for code generation. The MoE machine sheds RBI research/implement work and focuses on trading inference + backtesting.
+
+```
+  ┌──────────────────────────────┐    ┌──────────────────────────────┐
+  │  MOE MACHINE (128GB / 5900X) │    │  CODER MACHINE               │
+  │                              │    │                              │
+  │  GPU: Custom Qwen3 MoE      │    │  GPU: Qwen Coder 7B         │
+  │  CPU: Qwen 3B (classifier)  │    │       DeepSeek R1 7B        │
+  │  CPU: Backtesting (128GB)   │    │                              │
+  │  Dashboard :3939            │    │  RBI Research                │
+  │                              │    │  RBI Implementation         │
+  │  Sentiment · Anomaly         │    │                              │
+  │  Stream · Signal · Liquidation│    │                              │
+  │                              │    │                              │
+  │  APIs: Risk (Claude)         │    │  APIs: NVIDIA NIM (overflow) │
+  │        Polymarket (NVIDIA)   │    │                              │
+  └──────────────────────────────┘    └──────────────────────────────┘
+```
+
+### 3-Node: MoE + Coder + Sentinel
+
+Offload fast 3B classification to a dedicated GPU. The MoE machine no longer runs Ollama — pure vLLM trading inference + CPU backtesting.
+
+```
+  ┌───────────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+  │  MOE (128GB / 5900X)  │  │  CODER            │  │  SENTINEL         │
+  │                       │  │                  │  │                  │
+  │  GPU: Qwen3 MoE only │  │  GPU: Coder 7B   │  │  GPU: Qwen 3B    │
+  │  CPU: Backtesting     │  │       R1 7B      │  │       (fast)     │
+  │  Dashboard :3939     │  │                  │  │                  │
+  │                       │  │  RBI Research    │  │  Stream Observer │
+  │  Sentiment            │  │  RBI Implement   │  │  Signal Classify │
+  │  Anomaly Hunter       │  │                  │  │  Liquidation Det │
+  └───────────────────────┘  └──────────────────┘  └──────────────────┘
+```
+
+### 4-Node: Full Fleet
+
+Add a dedicated Queen for orchestration. MoE machine is 100% focused on trading inference + backtesting.
+
+```
+  ┌───────────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+  │  MOE (Strategist) │  │  CODER        │  │  SENTINEL     │  │  QUEEN        │
+  │                   │  │              │  │              │  │              │
+  │  GPU: Qwen3 MoE  │  │  GPU: Coder  │  │  GPU: 3B     │  │  Dashboard   │
+  │  CPU: Backtesting │  │       R1     │  │  (fast)      │  │  :3939       │
+  │                   │  │              │  │              │  │              │
+  │  Sentiment        │  │  RBI Research│  │  Stream Obs  │  │  Risk Mgr    │
+  │  Anomaly          │  │  RBI Impl   │  │  Signal Cls  │  │  (Claude API)│
+  │  RBI Backtest     │  │              │  │  Liq Detect  │  │  Polymarket  │
+  └───────────────────┘  └──────────────┘  └──────────────┘  └──────────────┘
+```
+
+## Why Backtesting Lives on the MoE Machine
+
+The RBI Backtester always runs on the MoE machine regardless of fleet size:
+
+- **128GB DDR4** — Hold years of tick data in memory (vectorbt, backtrader)
+- **Ryzen 5900X** (12c/24t) — Parallel strategy evaluation, Monte Carlo sims
+- **CPU-bound task** — Backtesting doesn't need GPU, so it doesn't compete with vLLM
+- Other machines have 16-32GB RAM and slower CPUs — they'd bottleneck on data loading
 
 ## Dashboard
 
-Real-time monitoring at `http://<queen-node>:3939`:
+Real-time monitoring at `http://<dashboard-host>:3939`:
 
-- **Fleet overview** — 4 node cards with health, GPU load, loaded models
+- **Fleet overview** — node cards with health, GPU load, loaded models
 - **Agent status** — running/idle/error state for all 10 agents
 - **RBI Pipeline** — visual R→B→I progress tracker
 - **Event log** — live stream of routing decisions, completions, alerts
@@ -71,61 +110,83 @@ Real-time monitoring at `http://<queen-node>:3939`:
 
 | Task Type | Tier | Model | Why |
 |-----------|------|-------|-----|
-| Signal classification | Local | Qwen 3B | Speed-critical, simple pattern matching |
-| Sentiment analysis | Local | Custom Qwen3 MoE | Trained specifically for trading |
-| Liquidation detection | Local | Qwen 3B | Ultra-low latency required |
-| Stream observation | Local | Qwen 3B | Continuous, high-volume |
-| Anomaly detection | Local | Custom Qwen3 MoE | Trading-specific patterns |
-| Order generation | Local | Custom Qwen3 MoE | Structured output, trading formats |
-| Market summary | Free API | NVIDIA Nemotron 70B | Large context, free |
+| Signal classification | Local | Qwen 3B (CPU or GPU) | Speed-critical, simple pattern matching |
+| Sentiment analysis | Local | Custom Qwen3 MoE (GPU) | Trained specifically for trading |
+| Liquidation detection | Local | Qwen 3B (CPU or GPU) | Ultra-low latency required |
+| Stream observation | Local | Qwen 3B (CPU or GPU) | Continuous, high-volume |
+| Anomaly detection | Local | Custom Qwen3 MoE (GPU) | Trading-specific patterns |
+| Order generation | Local | Custom Qwen3 MoE (GPU) | Structured output, trading formats |
+| RBI backtest | Local | CPU (128GB MoE machine) | RAM + CPU intensive, not GPU |
 | RBI research | Free API | NVIDIA Nemotron 70B | Deep analysis, free |
 | RBI implementation | Free API | NVIDIA 70B | Robust code gen, free |
 | Polymarket analysis | Free API | NVIDIA 70B | Complex reasoning, free |
-| RBI backtest | Local | Qwen Coder 7B | Code generation, local |
+| Market summary | Free API | NVIDIA Nemotron 70B | Large context, free |
 | Risk assessment | Paid API | Claude Sonnet | Critical decisions need best reasoning |
 
 ## 8GB VRAM Model Recommendations
 
 Models quantized to fit in 8GB VRAM (GTX 1070 Ti):
 
-| Model | VRAM | Speed | Role |
+| Model | VRAM | Speed | Node |
 |-------|------|-------|------|
-| Qwen 2.5 3B Q5_K_M | ~2.5 GB | Fast | Classification, routing |
-| Qwen 2.5 7B Q4_K_M | ~5.2 GB | Medium | General inference |
-| Qwen 2.5 Coder 7B Q4_K_M | ~5.2 GB | Medium | Code generation |
-| DeepSeek R1 7B Q4_K_M | ~5.4 GB | Slow | Reasoning tasks |
-| Nomic Embed v1.5 | ~0.6 GB | Fast | Embeddings |
-| Custom Qwen3 MoE | ~6-7 GB | Medium | Trading-specific (via vLLM) |
-
-**With 4 nodes**, each keeps its model loaded permanently — no swapping needed.
+| Custom Qwen3 MoE | ~6-7 GB | Medium | MoE (vLLM, GPU) |
+| Qwen 2.5 3B Q5_K_M | ~2.5 GB | Fast | MoE (Ollama, CPU) or Sentinel (GPU) |
+| Qwen 2.5 Coder 7B Q4_K_M | ~5.2 GB | Medium | Coder (GPU) |
+| DeepSeek R1 7B Q4_K_M | ~5.4 GB | Slow | Coder (GPU) |
+| Qwen 2.5 7B Q4_K_M | ~5.2 GB | Medium | Queen (GPU) |
+| Nomic Embed v1.5 | ~0.6 GB | Fast | Any (embeddings) |
 
 ## Quick Start
 
-### 2-Node Starter Setup
+### Step 1: Set Up the MoE Machine (Always First)
+
+This is your anchor node — 128GB DDR4, Ryzen 5900X, GTX 1070 Ti.
 
 ```bash
-# Machine 1: Sentinel + Strategist (your Qwen3 MoE machine)
-NODE_ROLE=general CUSTOM_QWEN_MODEL_PATH=/path/to/qwen3-moe ./setup-fleet.sh
-
-# Machine 2: Queen + Coder (hosts the dashboard)
-NODE_ROLE=reasoning ./setup-fleet.sh
+# On the MoE machine
+NODE_ROLE=moe CUSTOM_QWEN_MODEL_PATH=/path/to/qwen3-moe ./setup-fleet.sh
 ```
 
-### 4-Node Full Setup
+This will:
+- Install Ollama in **CPU-only** mode (vLLM gets the GPU)
+- Pull Qwen 3B for fast classification (runs on CPU, fast enough with 128GB RAM)
+- Start vLLM with your custom Qwen3 MoE on GPU
+- Print a config snippet for `openclaw.json`
+
+**You can stop here.** With 1 node, the system works — APIs handle research, risk, and polymarket.
+
+### Step 2: Add a Coder Machine (Recommended)
+
+When you have a second GPU machine:
 
 ```bash
-# Machine 1: Sentinel — fast 3B models for real-time feeds
-NODE_ROLE=fast ./setup-fleet.sh
-
-# Machine 2: Strategist — custom Qwen3 MoE for trading
-NODE_ROLE=general CUSTOM_QWEN_MODEL_PATH=/path/to/qwen3-moe ./setup-fleet.sh
-
-# Machine 3: Coder — Qwen Coder + DeepSeek R1 for RBI pipeline
-NODE_ROLE=reasoning ./setup-fleet.sh
-
-# Machine 4: Queen — dashboard + risk management + API gateway
-NODE_ROLE=reasoning ./setup-fleet.sh
+# On the Coder machine
+NODE_ROLE=coder ./setup-fleet.sh
 ```
+
+This pulls Qwen Coder 7B + DeepSeek R1 7B onto the GPU. Update your `openclaw.json` fleetNodes to include both machines.
+
+### Step 3: Add a Sentinel Machine (Optional)
+
+Offload fast 3B classification from MoE CPU to a dedicated GPU:
+
+```bash
+# On the Sentinel machine
+NODE_ROLE=sentinel ./setup-fleet.sh
+```
+
+Frees the MoE machine's CPU for backtesting. Remove the sentinel agents from the MoE node's config.
+
+### Step 4: Add a Dedicated Queen (Optional)
+
+At 4 nodes, you can give the orchestrator its own machine:
+
+```bash
+# On the Queen machine
+NODE_ROLE=queen ./setup-fleet.sh
+```
+
+Move the dashboard and API-backed agents (risk, polymarket) off the MoE machine.
 
 ### Starting the System
 
@@ -181,18 +242,16 @@ Set `ANTHROPIC_API_KEY` in your environment.
 
 ## Laptop Remote Control
 
-Control your fleet from a laptop without any GPU. The laptop connects to the Queen node's dashboard over your LAN.
+Control your fleet from a laptop without any GPU. The laptop connects to the dashboard host over your LAN.
 
 ```
-  ┌──────────────┐         ┌──────────────────┐    ┌──────────────────┐
-  │   LAPTOP     │  HTTP   │ Node 1: Sentinel │    │ Node 2: Queen    │
-  │  (no GPU)    │────────▶│ + Strategist     │    │ + Coder          │
-  │              │    │    │                  │    │                  │
-  │ OpenClaw CLI │    │    │ Qwen 3B + MoE    │    │ Dashboard :3939  │
-  │ or Browser   │    │    └──────────────────┘    └──────────────────┘
-  └──────────────┘    │                                     ▲
-                      └─────────────────────────────────────┘
-                              All commands proxy to Queen
+  ┌──────────────┐         ┌──────────────────────────────┐
+  │   LAPTOP     │  HTTP   │  MOE MACHINE (128GB / 5900X)  │
+  │  (no GPU)    │────────▶│  Dashboard :3939              │
+  │              │         │                              │
+  │ OpenClaw CLI │         │  Controls the entire fleet   │
+  │ or Browser   │         └──────────────────────────────┘
+  └──────────────┘
 ```
 
 ### Laptop Setup
@@ -204,24 +263,23 @@ Control your fleet from a laptop without any GPU. The laptop connects to the Que
 cp laptop.config.example.json ~/.openclaw/config.json
 ```
 
-3. Edit `remoteQueenHost` to match your Queen node's IP:
+3. Edit `remoteQueenHost` to match your MoE machine's IP:
 
 ```json
 {
   "plugins": {
     "apexclaw-gpu-optimizer": {
       "mode": "remote",
-      "remoteQueenHost": "192.168.1.102",
+      "remoteQueenHost": "192.168.1.101",
       "dashboardPort": 3939
     }
   }
 }
 ```
 
-4. Start the fleet on the GPU machines first, then control from your laptop:
+4. Control from your laptop:
 
 ```bash
-# From laptop — all commands proxy to the Queen node
 apexclaw-trade action:status        # fleet + agent snapshot
 apexclaw-trade action:dashboard     # get dashboard URL to open in browser
 apexclaw-trade action:pause         # pause all trading
@@ -230,32 +288,34 @@ apexclaw-trade action:emergency-stop reason:"market crash"
 apexclaw-trade action:rbi-start hypothesis:"BTC liquidation cascade"
 ```
 
-5. Or just open `http://<queen-ip>:3939` in your browser for the full dashboard.
+5. Or just open `http://<moe-machine-ip>:3939` in your browser for the full dashboard.
 
 ### Auto-Discovery
 
-If you don't know the Queen's IP, set `remoteQueenHost` to `"auto"`. The client will scan `192.168.1.100-110` for a responding dashboard server.
+If you don't know the dashboard host's IP, set `remoteQueenHost` to `"auto"`. The client will scan `192.168.1.100-110` for a responding dashboard server.
 
 ## Configuration
 
-See `apexclaw.config.example.json` for both 2-node and 4-node configs.
+See `apexclaw.config.example.json` for 1/2/3/4-node configs. The active config uses the `fleetNodes` field — copy the appropriate `_Xnode_fleetNodes` array into it when scaling up.
 
 ## Trading Agents (RBI Pipeline)
 
 10 specialized agents across the fleet:
 
-| Agent | Node | Mode | Default Tier |
-|-------|------|------|-------------|
-| Stream Observer | Sentinel | Continuous | Local (3B) |
-| Signal Classifier | Sentinel | Continuous | Local (3B) |
-| Liquidation Detector | Sentinel | Continuous | Local (3B) |
-| Sentiment Analyzer | Strategist | Every 15min | Local (Qwen3 MoE) |
-| Anomaly Hunter | Strategist | Every 4h | Local (Qwen3 MoE) |
-| RBI Researcher | Coder | On-demand | Free API (NVIDIA 70B) |
-| RBI Backtester | Coder | On-demand | Local (Coder 7B) |
-| RBI Implementer | Coder | On-demand | Free API (NVIDIA 70B) |
-| Risk Manager | Queen | Every 5min | Paid API (Claude) |
-| Polymarket Analyst | Queen | Every 30min | Free API (NVIDIA 70B) |
+| Agent | Where It Runs | Mode | Default Tier |
+|-------|--------------|------|-------------|
+| Stream Observer | MoE CPU → Sentinel GPU | Continuous | Local (3B) |
+| Signal Classifier | MoE CPU → Sentinel GPU | Continuous | Local (3B) |
+| Liquidation Detector | MoE CPU → Sentinel GPU | Continuous | Local (3B) |
+| Sentiment Analyzer | MoE GPU (always) | Every 15min | Local (Qwen3 MoE) |
+| Anomaly Hunter | MoE GPU (always) | Every 4h | Local (Qwen3 MoE) |
+| RBI Researcher | APIs → Coder GPU | On-demand | Free API (NVIDIA 70B) |
+| RBI Backtester | MoE CPU (always) | On-demand | Local (128GB RAM) |
+| RBI Implementer | APIs → Coder GPU | On-demand | Free API (NVIDIA 70B) |
+| Risk Manager | APIs (always) | Every 5min | Paid API (Claude) |
+| Polymarket Analyst | APIs (always) | Every 30min | Free API (NVIDIA 70B) |
+
+**"→" means**: starts on the left (fewer nodes), moves to the right when that machine is added.
 
 ## Cost Estimate
 
@@ -263,7 +323,7 @@ For a moderate trading setup (~7,000 inference calls/day):
 
 | Tier | Monthly Cost | Tasks |
 |------|-------------|-------|
-| Local GPU (4x 1070 Ti) | $0 | ~5,500 calls |
+| Local GPU + CPU | $0 | ~5,500 calls |
 | Free APIs (NVIDIA/Grok) | $0 | ~1,200 calls |
 | Paid APIs (Claude/Grok Pro) | ~$5-20 | ~300 calls (risk only) |
 
