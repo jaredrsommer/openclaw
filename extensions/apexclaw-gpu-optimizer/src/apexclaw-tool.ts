@@ -209,7 +209,25 @@ export function createApexClawTool(api: OpenClawPluginApi) {
             dashboardPort: pluginCfg.dashboardPort ?? 3939,
           };
           activeFleet = new FleetManager(fc);
-          activeOrchestrator = new QueenOrchestrator(activeFleet);
+          // Find the MoE node's Ollama URL for local embeddings
+          const moeNode = fc.nodes.find((n) => n.hasCustomQwen) ?? fc.nodes[0];
+          activeOrchestrator = new QueenOrchestrator(
+            activeFleet,
+            // Local embeddings config (nomic-embed-text on CPU via Ollama)
+            moeNode ? {
+              ollamaUrl: `http://${moeNode.host}:${moeNode.ollamaPort}`,
+              model: "nomic-embed-text:v1.5",
+              maxCacheEntries: 500_000,
+            } : undefined,
+            // API optimizer config
+            {
+              cacheTtlMs: 60_000,
+              endpoints: moeNode ? {
+                ollama: `http://${moeNode.host}:${moeNode.ollamaPort}`,
+                vllm: `http://${moeNode.host}:${moeNode.vllmPort}/v1`,
+              } : undefined,
+            },
+          );
           await activeOrchestrator.start();
 
           const dashPort = pluginCfg.dashboardPort ?? 3939;
@@ -250,7 +268,7 @@ export function createApexClawTool(api: OpenClawPluginApi) {
           return {
             content: [{
               type: "text",
-              text: `Dashboard running at http://localhost:${dp}\n\nOpen in your browser to see:\n- 4-node fleet status (Sentinel, Strategist, Coder, Queen)\n- Agent status and routing decisions\n- RBI pipeline progress\n- Real-time event stream\n- Cost tracking across tiers`,
+              text: `Dashboard running at http://localhost:${dp}\n\nOpen in your browser to see:\n- Fleet status (scales 1-4 nodes)\n- Agent status and routing decisions\n- RBI pipeline progress\n- Embedding cache stats (local nomic-embed-text)\n- API optimizer stats (dedup, cache hit rate, queuing)\n- Signal dedup rate\n- Real-time event stream\n- Cost tracking across tiers`,
             }],
           };
         }

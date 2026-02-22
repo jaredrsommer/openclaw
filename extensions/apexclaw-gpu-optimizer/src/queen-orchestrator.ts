@@ -1,17 +1,20 @@
 /**
- * Queen Orchestrator — the supervisor agent that coordinates the 4-node fleet.
+ * Queen Orchestrator — the supervisor agent that coordinates the fleet.
  *
  * Modeled after MoonDev's "queen" agent concept: a central coordinator that
  * monitors all worker nodes, manages the RBI pipeline flow, enforces risk
  * limits, and can issue fleet-wide directives (pause trading, rebalance, etc).
  *
- * The Queen runs on Node 4 alongside the dashboard and is the only agent
- * allowed to call paid APIs (Claude Max) for critical reasoning decisions.
+ * Runs on the MoE machine (1-3 node setups) or a dedicated Queen node (4-node).
+ * Integrates the local embedding service for signal deduplication and the API
+ * optimizer for efficient request handling across all agents.
  */
 
 import { FleetManager, type FleetEvent, type FleetNodeStatus } from "./fleet-manager.js";
 import { ALL_AGENTS, getContinuousAgents, getScheduledAgents, type AgentTemplate } from "./trading-agents.js";
 import type { TradingTaskType } from "./tiered-router.js";
+import { LocalEmbeddingService, type EmbeddingServiceConfig } from "./local-embeddings.js";
+import { ApiOptimizer, type ApiOptimizerConfig } from "./api-optimizer.js";
 
 export type QueenState = "running" | "paused" | "emergency-stop" | "starting";
 
@@ -62,6 +65,16 @@ export type OrchestratorSnapshot = {
     freeApi: { calls: number; costUsd: number };
     paidApi: { calls: number; costUsd: number };
   };
+  /** Local embedding service stats (nomic-embed-text on CPU) */
+  embeddings: ReturnType<LocalEmbeddingService["getStats"]> | null;
+  /** API optimizer stats (caching, dedup, queuing) */
+  apiOptimizer: ReturnType<ApiOptimizer["getStats"]> | null;
+  /** Recent signal dedup results */
+  signalDedup: {
+    totalChecked: number;
+    duplicatesBlocked: number;
+    dedupRate: string;
+  };
 };
 
 export class QueenOrchestrator {
@@ -91,7 +104,23 @@ export class QueenOrchestrator {
   };
   private schedulerTimers: ReturnType<typeof setInterval>[] = [];
 
-  constructor(private fleet: FleetManager) {
+  /** Local embedding service — nomic-embed-text on CPU (MoE machine) */
+  readonly embeddings: LocalEmbeddingService;
+  /** API optimizer — caching, dedup, queuing for all providers */
+  readonly apiOptimizer: ApiOptimizer;
+  /** Recent signals for dedup checking (rolling window) */
+  private recentSignals: string[] = [];
+  private readonly maxRecentSignals = 200;
+  private signalDedupStats = { totalChecked: 0, duplicatesBlocked: 0 };
+
+  constructor(
+    private fleet: FleetManager,
+    embeddingConfig?: Partial<EmbeddingServiceConfig>,
+    apiConfig?: Partial<ApiOptimizerConfig>,
+  ) {
+    // Initialize optimization services
+    this.embeddings = new LocalEmbeddingService(embeddingConfig);
+    this.apiOptimizer = new ApiOptimizer(apiConfig);
     // Initialize agent states
     for (const agent of ALL_AGENTS) {
       this.agentStates.set(agent.id, {
@@ -260,9 +289,52 @@ export class QueenOrchestrator {
     this.portfolio = { ...this.portfolio, ...snapshot, timestamp: Date.now() };
   }
 
+  /**
+   * Check if a trading signal is a duplicate of a recently seen signal.
+   * Uses local embeddings (nomic-embed-text on CPU) for semantic similarity.
+   * Prevents the same signal from triggering multiple trades.
+   */
+  async checkSignalDuplicate(
+    signalJson: string,
+    threshold = 0.92,
+  ): Promise<{ isDuplicate: boolean; bestMatch: number; matchIndex: number }> {
+    this.signalDedupStats.totalChecked++;
+
+    const result = await this.embeddings.isDuplicateSignal(
+      signalJson,
+      this.recentSignals,
+      threshold,
+    );
+
+    if (result.isDuplicate) {
+      this.signalDedupStats.duplicatesBlocked++;
+    } else {
+      // Not a duplicate — add to recent signals window
+      this.recentSignals.push(signalJson);
+      if (this.recentSignals.length > this.maxRecentSignals) {
+        this.recentSignals.shift();
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Find strategies similar to a given hypothesis using embeddings.
+   * Useful for the RBI pipeline to avoid re-researching similar ideas.
+   */
+  async findSimilarStrategies(
+    hypothesis: string,
+    pastStrategies: string[],
+    topK = 3,
+  ): Promise<Array<{ text: string; score: number; index: number }>> {
+    return this.embeddings.findMostSimilar(hypothesis, pastStrategies, topK);
+  }
+
   /** Get the full orchestrator snapshot for the dashboard */
   getSnapshot(): OrchestratorSnapshot {
     const fleetStatus = this.fleet.getStatus();
+    const total = this.signalDedupStats.totalChecked;
     return {
       state: this.state,
       uptime: fleetStatus.uptimeMs,
@@ -277,6 +349,14 @@ export class QueenOrchestrator {
       },
       recentEvents: this.fleet.getEventLog().slice(-50),
       tierStats: { ...this.tierStats },
+      embeddings: this.embeddings.getStats(),
+      apiOptimizer: this.apiOptimizer.getStats(),
+      signalDedup: {
+        ...this.signalDedupStats,
+        dedupRate: total > 0
+          ? `${((this.signalDedupStats.duplicatesBlocked / total) * 100).toFixed(1)}%`
+          : "0%",
+      },
     };
   }
 
