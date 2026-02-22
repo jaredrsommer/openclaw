@@ -15,6 +15,7 @@ import { ALL_AGENTS, getContinuousAgents, getScheduledAgents, type AgentTemplate
 import type { TradingTaskType } from "./tiered-router.js";
 import { LocalEmbeddingService, type EmbeddingServiceConfig } from "./local-embeddings.js";
 import { ApiOptimizer, type ApiOptimizerConfig } from "./api-optimizer.js";
+import { AgentBus, TOPICS, type AgentBusConfig, type AgentMessage } from "./agent-bus.js";
 
 export type QueenState = "running" | "paused" | "emergency-stop" | "starting";
 
@@ -69,6 +70,8 @@ export type OrchestratorSnapshot = {
   embeddings: ReturnType<LocalEmbeddingService["getStats"]> | null;
   /** API optimizer stats (caching, dedup, queuing) */
   apiOptimizer: ReturnType<ApiOptimizer["getStats"]> | null;
+  /** Agent message bus stats */
+  messageBus: ReturnType<AgentBus["getStats"]> | null;
   /** Recent signal dedup results */
   signalDedup: {
     totalChecked: number;
@@ -108,6 +111,8 @@ export class QueenOrchestrator {
   readonly embeddings: LocalEmbeddingService;
   /** API optimizer — caching, dedup, queuing for all providers */
   readonly apiOptimizer: ApiOptimizer;
+  /** Agent message bus — inter-agent communication */
+  readonly bus: AgentBus;
   /** Recent signals for dedup checking (rolling window) */
   private recentSignals: string[] = [];
   private readonly maxRecentSignals = 200;
@@ -117,10 +122,15 @@ export class QueenOrchestrator {
     private fleet: FleetManager,
     embeddingConfig?: Partial<EmbeddingServiceConfig>,
     apiConfig?: Partial<ApiOptimizerConfig>,
+    busConfig?: Partial<AgentBusConfig>,
   ) {
     // Initialize optimization services
     this.embeddings = new LocalEmbeddingService(embeddingConfig);
     this.apiOptimizer = new ApiOptimizer(apiConfig);
+    this.bus = new AgentBus(busConfig);
+
+    // Wire up Queen's subscriptions to the bus
+    this.setupBusSubscriptions();
     // Initialize agent states
     for (const agent of ALL_AGENTS) {
       this.agentStates.set(agent.id, {
@@ -148,9 +158,66 @@ export class QueenOrchestrator {
     });
   }
 
+  /** Set up Queen's subscriptions to the message bus */
+  private setupBusSubscriptions(): void {
+    // Queen monitors all classified signals for risk gating
+    this.bus.subscribe("queen", TOPICS.SIGNALS_CLASSIFIED, async (msg) => {
+      // Check for duplicate signals before allowing trade execution
+      const signalJson = JSON.stringify(msg.payload);
+      const dedup = await this.checkSignalDuplicate(signalJson);
+      if (!dedup.isDuplicate) {
+        // Forward validated signal to risk manager
+        await this.bus.publish("queen", TOPICS.SIGNALS_VALIDATED, msg.payload, {
+          summary: `Queen validated signal from ${msg.from}`,
+          inReplyTo: msg.id,
+          chain: [...(msg.chain ?? []), msg.id],
+        });
+      }
+    });
+
+    // Queen monitors RBI pipeline progression
+    this.bus.subscribe("queen", TOPICS.RBI_RESEARCH, (msg) => {
+      this.rbiPipeline.stage = "backtest";
+      this.rbiPipeline.status = "backtesting";
+      this.rbiPipeline.progress = 33;
+      this.rbiPipeline.lastOutput = msg.summary;
+    });
+
+    this.bus.subscribe("queen", TOPICS.RBI_BACKTEST, (msg) => {
+      this.rbiPipeline.stage = "implement";
+      this.rbiPipeline.status = "implementing";
+      this.rbiPipeline.progress = 66;
+      this.rbiPipeline.lastOutput = msg.summary;
+    });
+
+    this.bus.subscribe("queen", TOPICS.RBI_IMPLEMENT, (msg) => {
+      this.rbiPipeline.status = "complete";
+      this.rbiPipeline.progress = 100;
+      this.rbiPipeline.lastOutput = msg.summary;
+    });
+
+    // Queen monitors risk assessments
+    this.bus.subscribe("queen", TOPICS.RISK_ASSESSMENT, (msg) => {
+      const risk = msg.payload as { portfolioRisk?: string } | undefined;
+      if (risk?.portfolioRisk === "CRITICAL") {
+        this.emergencyStop(`Risk Manager: ${msg.summary}`);
+      }
+    });
+
+    // Queen monitors errors
+    this.bus.subscribe("queen", TOPICS.ERRORS, (msg) => {
+      const agentState = this.agentStates.get(msg.from);
+      if (agentState) {
+        agentState.errorCount++;
+        agentState.lastResult = `Error: ${msg.summary}`;
+      }
+    });
+  }
+
   /** Start the orchestrator: assign agents to nodes and begin scheduling */
   async start(): Promise<void> {
     this.state = "starting";
+    this.bus.start();
     this.fleet.start();
 
     // Wait for initial health check
@@ -166,6 +233,12 @@ export class QueenOrchestrator {
       this.scheduleAgent(agent);
     }
 
+    // Announce startup on the bus
+    await this.bus.publish("queen", TOPICS.QUEEN_DIRECTIVES, {
+      action: "START",
+      nodes: this.fleet.getStatus().totalNodes,
+    }, { summary: "Queen orchestrator started" });
+
     this.state = "running";
   }
 
@@ -177,6 +250,7 @@ export class QueenOrchestrator {
     }
     this.schedulerTimers = [];
     this.fleet.stop();
+    this.bus.stop();
 
     for (const [, agentState] of this.agentStates) {
       agentState.status = "stopped";
@@ -256,15 +330,29 @@ export class QueenOrchestrator {
     }
   }
 
-  /** Trigger an RBI pipeline run */
-  startRbiPipeline(hypothesis: string): void {
+  /** Trigger an RBI pipeline run — publishes to the bus for agent coordination */
+  async startRbiPipeline(hypothesis: string): Promise<void> {
+    const strategyId = `rbi-${Date.now()}`;
     this.rbiPipeline = {
       status: "researching",
-      currentStrategyId: `rbi-${Date.now()}`,
+      currentStrategyId: strategyId,
       stage: "research",
       progress: 0,
       lastOutput: `Starting research on: ${hypothesis}`,
     };
+
+    // Store hypothesis in shared context for all RBI agents to read
+    this.bus.setContext(`rbi:${strategyId}:hypothesis`, hypothesis, "queen");
+
+    // Publish research request to the bus — rbi-researcher picks it up
+    await this.bus.publish("queen", TOPICS.RBI_STATUS, {
+      strategyId,
+      stage: "research",
+      hypothesis,
+    }, {
+      summary: `RBI pipeline started: ${hypothesis}`,
+      type: "directive",
+    });
   }
 
   /** Advance RBI pipeline to next stage */
@@ -351,6 +439,7 @@ export class QueenOrchestrator {
       tierStats: { ...this.tierStats },
       embeddings: this.embeddings.getStats(),
       apiOptimizer: this.apiOptimizer.getStats(),
+      messageBus: this.bus.getStats(),
       signalDedup: {
         ...this.signalDedupStats,
         dedupRate: total > 0

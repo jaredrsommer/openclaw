@@ -1,24 +1,28 @@
 /**
  * Dashboard web server for ApexClaw fleet monitoring.
  *
- * Lightweight HTTP + WebSocket server that serves the dashboard UI and
- * streams real-time fleet state to connected browsers.
+ * Lightweight HTTP + SSE server that serves the dashboard UI and
+ * streams real-time fleet state + agent-to-agent comms to connected browsers.
  *
- * Runs on the Queen node (Node 4) at the configured dashboardPort (default 3939).
+ * Runs on the dashboard host node at the configured dashboardPort (default 3939).
  *
  * Endpoints:
  *   GET /              → Dashboard HTML
  *   GET /api/snapshot  → Full orchestrator state JSON
  *   GET /api/agents    → Agent list with routing info
  *   GET /api/fleet     → Fleet node statuses
+ *   GET /api/bus       → Message bus stats + recent messages
+ *   GET /api/bus/topic/:topic → Messages for a specific topic
+ *   GET /api/bus/agent/:id → Messages from/to a specific agent
  *   POST /api/command  → Send orchestrator commands (pause, resume, emergency-stop, rbi-start)
- *   WS /ws             → Real-time event stream
+ *   GET /api/events    → SSE real-time event stream (fleet + agent comms)
  */
 
 import http from "node:http";
 import { type QueenOrchestrator } from "./queen-orchestrator.js";
 import { type FleetManager } from "./fleet-manager.js";
 import { DASHBOARD_HTML } from "./dashboard-ui.js";
+import { ALL_AGENTS, getAgentDisplay, setAgentCustomName } from "./trading-agents.js";
 
 export type DashboardConfig = {
   port: number;
@@ -36,15 +40,38 @@ export function startDashboardServer(
 
   // Subscribe to fleet events and forward to all SSE clients
   fleet.onEvent((event) => {
-    const data = JSON.stringify(event);
+    broadcast({ ...event, source: "fleet" });
+  });
+
+  // Subscribe to ALL bus messages and forward to SSE clients
+  // The "*" wildcard topic catches every message on the bus
+  orchestrator.bus.subscribe("queen", "*", (msg) => {
+    broadcast({
+      source: "bus",
+      type: "bus-message",
+      timestamp: msg.timestamp,
+      id: msg.id,
+      from: msg.from,
+      to: msg.to,
+      topic: msg.topic,
+      msgType: msg.type,
+      summary: msg.summary,
+      hasPayload: msg.payload !== undefined,
+      inReplyTo: msg.inReplyTo,
+      chain: msg.chain,
+    });
+  });
+
+  function broadcast(data: unknown): void {
+    const json = JSON.stringify(data);
     for (const client of sseClients) {
       try {
-        client.write(`data: ${data}\n\n`);
+        client.write(`data: ${json}\n\n`);
       } catch {
         sseClients.delete(client);
       }
     }
-  });
+  }
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
@@ -83,6 +110,90 @@ export function startDashboardServer(
     if (url.pathname === "/api/fleet" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(fleet.getStatus()));
+      return;
+    }
+
+    // --- Agent naming ---
+
+    if (url.pathname === "/api/agents/names" && req.method === "GET") {
+      const names: Record<string, { name: string; avatar: string }> = {};
+      for (const agent of ALL_AGENTS) {
+        names[agent.id] = getAgentDisplay(agent.id);
+      }
+      // Include "queen" which isn't in ALL_AGENTS
+      names["queen"] = { name: "Queen", avatar: "QN" };
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(names));
+      return;
+    }
+
+    if (url.pathname === "/api/agents/rename" && req.method === "POST") {
+      let body = "";
+      req.on("data", (chunk) => { body += chunk; });
+      req.on("end", () => {
+        try {
+          const { agentId, customName } = JSON.parse(body) as { agentId: string; customName: string };
+          if (!agentId || !customName) throw new Error("agentId and customName required");
+          const ok = setAgentCustomName(agentId, customName);
+          if (!ok) throw new Error(`Unknown agent: ${agentId}`);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, agentId, customName }));
+        } catch (err) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: String(err) }));
+        }
+      });
+      return;
+    }
+
+    // --- Message Bus API endpoints ---
+
+    if (url.pathname === "/api/bus" && req.method === "GET") {
+      const stats = orchestrator.bus.getStats();
+      const recent = orchestrator.bus.getTopicHistory("*", 0); // no wildcard history, use all topics
+      // Collect last 100 messages across all topics
+      const allRecent: unknown[] = [];
+      for (const topic of Object.keys(stats.topicCounts)) {
+        allRecent.push(...orchestrator.bus.getTopicHistory(topic, 20));
+      }
+      allRecent.sort((a: any, b: any) => a.timestamp - b.timestamp);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        stats,
+        recentMessages: allRecent.slice(-100),
+      }));
+      return;
+    }
+
+    // /api/bus/topic/:topic — messages for a specific topic (dot-separated)
+    const topicMatch = url.pathname.match(/^\/api\/bus\/topic\/(.+)$/);
+    if (topicMatch && req.method === "GET") {
+      const topic = decodeURIComponent(topicMatch[1]!);
+      const limit = parseInt(url.searchParams.get("limit") ?? "50", 10);
+      const messages = orchestrator.bus.getTopicHistory(topic, limit);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ topic, count: messages.length, messages }));
+      return;
+    }
+
+    // /api/bus/agent/:id — messages from/to a specific agent
+    const agentMatch = url.pathname.match(/^\/api\/bus\/agent\/(.+)$/);
+    if (agentMatch && req.method === "GET") {
+      const agentId = decodeURIComponent(agentMatch[1]!) as any;
+      const limit = parseInt(url.searchParams.get("limit") ?? "50", 10);
+      const messages = orchestrator.bus.getAgentHistory(agentId, limit);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ agentId, count: messages.length, messages }));
+      return;
+    }
+
+    // /api/bus/chain/:messageId — conversation chain for a message
+    const chainMatch = url.pathname.match(/^\/api\/bus\/chain\/(.+)$/);
+    if (chainMatch && req.method === "GET") {
+      const messageId = decodeURIComponent(chainMatch[1]!);
+      const chain = orchestrator.bus.getChain(messageId);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ messageId, count: chain.length, chain }));
       return;
     }
 
