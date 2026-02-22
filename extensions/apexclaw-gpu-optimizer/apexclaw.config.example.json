@@ -1,6 +1,7 @@
 {
   "$schema": "openclaw-config",
-  "_comment": "ApexClaw sample config for a 3-node GTX 1070 Ti fleet with Claude Max + Grok + NVIDIA NIM free tier",
+  "_comment_1": "ApexClaw config for GTX 1070 Ti fleet + Claude Max + Grok + NVIDIA NIM",
+  "_comment_2": "Supports 1-4 nodes. Start with 2 and add more later — the system auto-adapts.",
 
   "models": {
     "providers": {
@@ -115,15 +116,6 @@
             "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
           },
           {
-            "id": "grok-2-mini",
-            "name": "Grok 2 Mini (Fast)",
-            "reasoning": false,
-            "input": ["text"],
-            "contextWindow": 131072,
-            "maxTokens": 4096,
-            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
-          },
-          {
             "id": "grok-3",
             "name": "Grok 3 (Reasoning)",
             "reasoning": true,
@@ -140,41 +132,96 @@
   "plugins": {
     "apexclaw-gpu-optimizer": {
       "gpuVramMb": 8192,
-      "localOllamaUrl": "http://127.0.0.1:11434",
-      "localVllmUrl": "http://127.0.0.1:8000/v1",
       "tradingMode": true,
       "maxLocalConcurrency": 1,
       "tier": "auto",
+      "dashboardPort": 3939,
+
+      "_comment_configs": "Pick ONE of the fleetNodes configs below based on how many machines you have:",
+
+      "_2node_config_comment": "=== 2-NODE STARTER (Sentinel+Strategist on node1, Queen+Coder on node2) ===",
       "fleetNodes": [
         {
-          "id": "node-1-fast",
+          "id": "node-1-sentinel",
+          "name": "Sentinel+Strategist",
           "host": "192.168.1.101",
           "ollamaPort": 11434,
           "vllmPort": 8000,
           "gpuVramMb": 8192,
-          "role": "fast",
-          "hasCustomQwen": false,
-          "maxConcurrency": 1
+          "role": "sentinel",
+          "hasCustomQwen": true,
+          "maxConcurrency": 2,
+          "assignedAgents": ["stream-observer", "signal-classifier", "liquidation-detector", "sentiment-analyzer", "anomaly-hunter"],
+          "isDashboardHost": false
         },
         {
-          "id": "node-2-trading",
+          "id": "node-2-queen",
+          "name": "Queen+Coder",
           "host": "192.168.1.102",
           "ollamaPort": 11434,
           "vllmPort": 8000,
           "gpuVramMb": 8192,
-          "role": "general",
-          "hasCustomQwen": true,
-          "maxConcurrency": 1
+          "role": "queen",
+          "hasCustomQwen": false,
+          "maxConcurrency": 1,
+          "assignedAgents": ["risk-manager", "polymarket-analyst", "rbi-researcher", "rbi-backtester", "rbi-implementer"],
+          "isDashboardHost": true
+        }
+      ],
+
+      "_4node_config_comment": "=== 4-NODE FULL (copy this over fleetNodes when you have all machines) ===",
+      "_4node_fleetNodes": [
+        {
+          "id": "node-1-sentinel",
+          "name": "Sentinel",
+          "host": "192.168.1.101",
+          "ollamaPort": 11434,
+          "vllmPort": 8000,
+          "gpuVramMb": 8192,
+          "role": "sentinel",
+          "hasCustomQwen": false,
+          "maxConcurrency": 2,
+          "assignedAgents": ["stream-observer", "signal-classifier", "liquidation-detector"],
+          "isDashboardHost": false
         },
         {
-          "id": "node-3-reasoning",
+          "id": "node-2-strategist",
+          "name": "Strategist",
+          "host": "192.168.1.102",
+          "ollamaPort": 11434,
+          "vllmPort": 8000,
+          "gpuVramMb": 8192,
+          "role": "strategist",
+          "hasCustomQwen": true,
+          "maxConcurrency": 1,
+          "assignedAgents": ["sentiment-analyzer", "anomaly-hunter"],
+          "isDashboardHost": false
+        },
+        {
+          "id": "node-3-coder",
+          "name": "Coder",
           "host": "192.168.1.103",
           "ollamaPort": 11434,
           "vllmPort": 8000,
           "gpuVramMb": 8192,
-          "role": "reasoning",
+          "role": "coder",
           "hasCustomQwen": false,
-          "maxConcurrency": 1
+          "maxConcurrency": 1,
+          "assignedAgents": ["rbi-researcher", "rbi-backtester", "rbi-implementer"],
+          "isDashboardHost": false
+        },
+        {
+          "id": "node-4-queen",
+          "name": "Queen",
+          "host": "192.168.1.104",
+          "ollamaPort": 11434,
+          "vllmPort": 8000,
+          "gpuVramMb": 8192,
+          "role": "queen",
+          "hasCustomQwen": false,
+          "maxConcurrency": 1,
+          "assignedAgents": ["risk-manager", "polymarket-analyst"],
+          "isDashboardHost": true
         }
       ]
     }

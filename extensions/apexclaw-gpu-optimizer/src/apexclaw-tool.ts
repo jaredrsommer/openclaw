@@ -1,8 +1,9 @@
 /**
  * ApexClaw GPU-optimized trading tool for OpenClaw.
  *
- * Exposes the tiered model router and trading agent system as an
- * OpenClaw tool that can be invoked from the agent/chat interface.
+ * Exposes the tiered model router, 4-node fleet orchestrator, and trading
+ * agent system as an OpenClaw tool invokable from the agent/chat interface.
+ * Also starts the dashboard server on the Queen node.
  */
 
 import { Type } from "@sinclair/typebox";
@@ -11,6 +12,8 @@ import { routeTask, estimateMonthlyCost, type RouterConfig, type TradingTaskType
 import { ALL_AGENTS, getAgent } from "./trading-agents.js";
 import { resolveGpuProfile, modelsForVram } from "./gpu-profiles.js";
 import { FleetManager, DEFAULT_FLEET_CONFIG, type FleetConfig } from "./fleet-manager.js";
+import { QueenOrchestrator } from "./queen-orchestrator.js";
+import { startDashboardServer } from "./dashboard-server.js";
 
 type PluginCfg = {
   gpuVramMb?: number;
@@ -22,6 +25,7 @@ type PluginCfg = {
   maxLocalConcurrency?: number;
   tradingMode?: boolean;
   fleetNodes?: FleetConfig["nodes"];
+  dashboardPort?: number;
 };
 
 function buildRouterConfig(cfg: PluginCfg): RouterConfig {
@@ -41,16 +45,21 @@ function buildRouterConfig(cfg: PluginCfg): RouterConfig {
   };
 }
 
+// Singleton state for the running orchestrator
+let activeFleet: FleetManager | null = null;
+let activeOrchestrator: QueenOrchestrator | null = null;
+let activeDashboard: ReturnType<typeof startDashboardServer> | null = null;
+
 export function createApexClawTool(api: OpenClawPluginApi) {
   return {
     name: "apexclaw-trade",
     label: "ApexClaw Trading Router",
     description:
-      "GPU-optimized trading agent router. Routes tasks across local GPU models (Ollama/vLLM on 8GB GPUs), free APIs (NVIDIA NIM, Grok), and paid APIs (Claude Max). Supports RBI pipeline, liquidation detection, sentiment analysis, and risk management.",
+      "GPU-optimized trading agent router for 4x GTX 1070 Ti fleet. Routes tasks across local GPU models (Ollama/vLLM), free APIs (NVIDIA NIM, Grok), and paid APIs (Claude Max). Includes dashboard, RBI pipeline, liquidation detection, sentiment analysis, and risk management.",
     parameters: Type.Object({
       action: Type.String({
         description:
-          'Action: "route" (route a task), "agents" (list agents), "status" (fleet status), "gpu-info" (show GPU models), "cost-estimate" (monthly cost estimate)',
+          'Action: "route" (route a task), "agents" (list agents), "status" (fleet status), "gpu-info" (show GPU models), "cost-estimate" (monthly cost estimate), "dashboard" (start dashboard), "start" (start orchestrator), "stop" (stop orchestrator)',
       }),
       taskType: Type.Optional(
         Type.String({
@@ -130,10 +139,22 @@ export function createApexClawTool(api: OpenClawPluginApi) {
         }
 
         case "status": {
+          if (activeOrchestrator) {
+            const snapshot = activeOrchestrator.getSnapshot();
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify(snapshot, null, 2),
+              }],
+            };
+          }
+
+          // No orchestrator running — do a quick fleet probe
           const fleetConfig: FleetConfig = {
             nodes: pluginCfg.fleetNodes ?? DEFAULT_FLEET_CONFIG.nodes,
-            healthCheckIntervalMs: 30000,
+            healthCheckIntervalMs: 15000,
             healthCheckTimeoutMs: 5000,
+            dashboardPort: pluginCfg.dashboardPort ?? 3939,
           };
           const fleet = new FleetManager(fleetConfig);
           await fleet.checkAllHealth();
@@ -145,6 +166,7 @@ export function createApexClawTool(api: OpenClawPluginApi) {
             content: [{
               type: "text",
               text: JSON.stringify({
+                orchestratorRunning: false,
                 gpuProfile: {
                   name: gpuProfile.name,
                   vramMb: gpuProfile.vramMb,
@@ -160,6 +182,64 @@ export function createApexClawTool(api: OpenClawPluginApi) {
                   vllm: routerConfig.localVllmUrl,
                 },
               }, null, 2),
+            }],
+          };
+        }
+
+        case "start": {
+          if (activeOrchestrator) {
+            return { content: [{ type: "text", text: "Orchestrator already running." }] };
+          }
+
+          const fc: FleetConfig = {
+            nodes: pluginCfg.fleetNodes ?? DEFAULT_FLEET_CONFIG.nodes,
+            healthCheckIntervalMs: 15000,
+            healthCheckTimeoutMs: 5000,
+            dashboardPort: pluginCfg.dashboardPort ?? 3939,
+          };
+          activeFleet = new FleetManager(fc);
+          activeOrchestrator = new QueenOrchestrator(activeFleet);
+          await activeOrchestrator.start();
+
+          const dashPort = pluginCfg.dashboardPort ?? 3939;
+          activeDashboard = startDashboardServer(activeOrchestrator, activeFleet, {
+            port: dashPort,
+            host: "0.0.0.0",
+          });
+
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                status: "started",
+                dashboard: `http://localhost:${dashPort}`,
+                fleet: activeFleet.getStatus(),
+              }, null, 2),
+            }],
+          };
+        }
+
+        case "stop": {
+          if (!activeOrchestrator) {
+            return { content: [{ type: "text", text: "Orchestrator not running." }] };
+          }
+          activeOrchestrator.stop();
+          activeDashboard?.close();
+          activeOrchestrator = null;
+          activeFleet = null;
+          activeDashboard = null;
+          return { content: [{ type: "text", text: "Orchestrator and dashboard stopped." }] };
+        }
+
+        case "dashboard": {
+          if (!activeOrchestrator || !activeFleet) {
+            return { content: [{ type: "text", text: "Start the orchestrator first with action: start" }] };
+          }
+          const dp = pluginCfg.dashboardPort ?? 3939;
+          return {
+            content: [{
+              type: "text",
+              text: `Dashboard running at http://localhost:${dp}\n\nOpen in your browser to see:\n- 4-node fleet status (Sentinel, Strategist, Coder, Queen)\n- Agent status and routing decisions\n- RBI pipeline progress\n- Real-time event stream\n- Cost tracking across tiers`,
             }],
           };
         }
@@ -228,7 +308,7 @@ export function createApexClawTool(api: OpenClawPluginApi) {
           return {
             content: [{
               type: "text",
-              text: `Unknown action "${action}". Available: route, agents, status, gpu-info, cost-estimate`,
+              text: `Unknown action "${action}". Available: start, stop, status, dashboard, route, agents, gpu-info, cost-estimate`,
             }],
           };
       }

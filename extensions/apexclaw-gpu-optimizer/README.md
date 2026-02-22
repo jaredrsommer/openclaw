@@ -1,26 +1,71 @@
 # ApexClaw GPU Optimizer
 
-GPU-optimized trading agent framework for OpenClaw, designed to run on low-end GPUs (8GB VRAM, e.g. GTX 1070 Ti) with a multi-tier inference strategy.
+GPU-optimized trading agent framework for OpenClaw, designed to run on low-end GPUs (8GB VRAM, e.g. GTX 1070 Ti) with a multi-tier inference strategy and a real-time monitoring dashboard.
 
-## Architecture
+## Architecture: 4-Node Fleet
+
+Inspired by MoonDev's multi-OpenClaw setup, but purpose-built for 4x GTX 1070 Ti machines with dedicated roles:
 
 ```
-                    ┌─────────────────────────────────────────┐
-                    │           Tiered Model Router            │
-                    │                                         │
-                    │  Task → Classify → Route → Execute      │
-                    └────────┬──────────┬──────────┬──────────┘
-                             │          │          │
-                    ┌────────▼──┐ ┌─────▼─────┐ ┌─▼──────────┐
-                    │  Tier 1   │ │  Tier 2   │ │   Tier 3   │
-                    │ Local GPU │ │ Free APIs │ │  Paid APIs  │
-                    │           │ │           │ │             │
-                    │ Ollama    │ │ NVIDIA    │ │ Claude Max  │
-                    │ vLLM      │ │ NIM       │ │ ($100/mo)  │
-                    │           │ │ Grok Free │ │ Grok Pro   │
-                    │ $0/mo     │ │ $0/mo     │ │ ~$5-20/mo  │
-                    └───────────┘ └───────────┘ └────────────┘
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                     QUEEN ORCHESTRATOR                          │
+  │            (Node 4 — coordinates everything)                    │
+  │                                                                 │
+  │  ┌─────────┐  ┌─────────────┐  ┌──────────┐  ┌─────────────┐  │
+  │  │Dashboard │  │Risk Manager │  │Polymarket│  │ API Gateway  │  │
+  │  │ :3939    │  │(Claude Max) │  │ Analyst  │  │Claude/Grok/NV│  │
+  │  └─────────┘  └─────────────┘  └──────────┘  └─────────────┘  │
+  └───────────────────────┬─────────────────────────────────────────┘
+                          │
+        ┌─────────────────┼─────────────────┐
+        │                 │                 │
+  ┌─────▼─────┐   ┌──────▼──────┐   ┌──────▼──────┐
+  │  SENTINEL  │   │ STRATEGIST  │   │   CODER     │
+  │  (Node 1)  │   │  (Node 2)   │   │  (Node 3)   │
+  │            │   │             │   │             │
+  │ Stream     │   │ Qwen3 MoE   │   │ Qwen Coder  │
+  │ Observer   │   │ (trading)   │   │ 7B          │
+  │ Signal     │   │             │   │             │
+  │ Classifier │   │ Sentiment   │   │ RBI         │
+  │ Liquidation│   │ Anomaly     │   │ Research    │
+  │ Detector   │   │ Hunter      │   │ Backtest    │
+  │            │   │             │   │ Implement   │
+  │ Qwen 3B   │   │ Custom MoE  │   │ DeepSeek R1 │
+  │ (fast)     │   │ via vLLM    │   │ 7B          │
+  └────────────┘   └─────────────┘   └─────────────┘
 ```
+
+### Scale as you go: 2-node starter
+
+**Don't have all 4 machines yet?** Start with 2 — the system adapts:
+
+```
+  ┌──────────────────┐    ┌──────────────────┐
+  │ Node 1: Sentinel │    │ Node 2: Queen    │
+  │ + Strategist     │    │ + Coder          │
+  │                  │    │                  │
+  │ Stream Observer  │    │ Risk Manager     │
+  │ Signal Classifier│    │ Polymarket       │
+  │ Liquidation Det. │    │ RBI Pipeline     │
+  │ Sentiment        │    │ Dashboard :3939  │
+  │ Anomaly Hunter   │    │                  │
+  │                  │    │ Qwen 7B / Coder  │
+  │ Qwen 3B + MoE   │    │ + API calls      │
+  └──────────────────┘    └──────────────────┘
+```
+
+Agents from missing nodes get reassigned to available ones. The free API tier (NVIDIA NIM, Grok) absorbs overflow from busy local GPUs.
+
+## Dashboard
+
+Real-time monitoring at `http://<queen-node>:3939`:
+
+- **Fleet overview** — 4 node cards with health, GPU load, loaded models
+- **Agent status** — running/idle/error state for all 10 agents
+- **RBI Pipeline** — visual R→B→I progress tracker
+- **Event log** — live stream of routing decisions, completions, alerts
+- **Tier cost tracker** — local (free) vs free API vs paid API spend
+- **Controls** — pause, resume, emergency stop from the browser
 
 ## Tier Routing Strategy
 
@@ -52,23 +97,43 @@ Models quantized to fit in 8GB VRAM (GTX 1070 Ti):
 | Nomic Embed v1.5 | ~0.6 GB | Fast | Embeddings |
 | Custom Qwen3 MoE | ~6-7 GB | Medium | Trading-specific (via vLLM) |
 
-**Important**: Only ONE 7B model can be loaded at a time on 8GB VRAM. The router handles model swapping automatically via Ollama's model management.
+**With 4 nodes**, each keeps its model loaded permanently — no swapping needed.
 
-## Fleet Setup (Multiple 1070 Ti Machines)
+## Quick Start
 
-### Quick Start
-
-On each machine:
+### 2-Node Starter Setup
 
 ```bash
-# Node 1: Fast classification node
-NODE_ROLE=fast ./setup-fleet.sh
-
-# Node 2: General + custom Qwen3 MoE
+# Machine 1: Sentinel + Strategist (your Qwen3 MoE machine)
 NODE_ROLE=general CUSTOM_QWEN_MODEL_PATH=/path/to/qwen3-moe ./setup-fleet.sh
 
-# Node 3: Reasoning node
+# Machine 2: Queen + Coder (hosts the dashboard)
 NODE_ROLE=reasoning ./setup-fleet.sh
+```
+
+### 4-Node Full Setup
+
+```bash
+# Machine 1: Sentinel — fast 3B models for real-time feeds
+NODE_ROLE=fast ./setup-fleet.sh
+
+# Machine 2: Strategist — custom Qwen3 MoE for trading
+NODE_ROLE=general CUSTOM_QWEN_MODEL_PATH=/path/to/qwen3-moe ./setup-fleet.sh
+
+# Machine 3: Coder — Qwen Coder + DeepSeek R1 for RBI pipeline
+NODE_ROLE=reasoning ./setup-fleet.sh
+
+# Machine 4: Queen — dashboard + risk management + API gateway
+NODE_ROLE=reasoning ./setup-fleet.sh
+```
+
+### Starting the System
+
+```
+apexclaw-trade action:start    → starts orchestrator + dashboard
+apexclaw-trade action:status   → full fleet + agent snapshot
+apexclaw-trade action:dashboard → dashboard URL
+apexclaw-trade action:stop     → graceful shutdown
 ```
 
 ### Custom Qwen3 MoE Setup
@@ -87,15 +152,6 @@ docker run -d --gpus all \
   --dtype half \
   --enforce-eager \
   --max-num-seqs 1
-
-# Or directly with pip
-pip install vllm
-vllm serve /path/to/model \
-  --gpu-memory-utilization 0.85 \
-  --max-model-len 8192 \
-  --dtype half \
-  --enforce-eager \
-  --port 8000
 ```
 
 Key vLLM flags for 8GB VRAM:
@@ -113,11 +169,6 @@ Key vLLM flags for 8GB VRAM:
 2. Get an API key (free tier includes generous rate limits)
 3. Set `NVIDIA_API_KEY` in your environment
 
-Available free models:
-- `nvidia/llama-3.1-nemotron-70b-instruct` — Best general model
-- `meta/llama-3.3-70b-instruct` — Alternative 70B
-- `nvidia/mistral-nemo-minitron-8b-8k-instruct` — Fast 8B model
-
 ### Grok (xAI)
 
 1. Get API access from your Grok subscription
@@ -130,39 +181,24 @@ Set `ANTHROPIC_API_KEY` in your environment.
 
 ## Configuration
 
-Copy `apexclaw.config.example.json` and merge into your `openclaw.json`:
-
-```json
-{
-  "plugins": {
-    "apexclaw-gpu-optimizer": {
-      "gpuVramMb": 8192,
-      "localOllamaUrl": "http://127.0.0.1:11434",
-      "localVllmUrl": "http://127.0.0.1:8000/v1",
-      "tradingMode": true,
-      "maxLocalConcurrency": 1,
-      "tier": "auto"
-    }
-  }
-}
-```
+See `apexclaw.config.example.json` for both 2-node and 4-node configs.
 
 ## Trading Agents (RBI Pipeline)
 
-10 specialized agents, each optimized for 8GB GPU inference:
+10 specialized agents across the fleet:
 
-| Agent | Mode | Task | Default Tier |
+| Agent | Node | Mode | Default Tier |
 |-------|------|------|-------------|
-| Stream Observer | Continuous | Market data monitoring | Local (3B) |
-| Signal Classifier | Continuous | Trade signal classification | Local (3B) |
-| Liquidation Detector | Continuous | Hyperliquid liquidation sniping | Local (3B) |
-| Sentiment Analyzer | Every 15min | Social/news sentiment | Local (Qwen3 MoE) |
-| Anomaly Hunter | Every 4h | Statistical anomaly detection | Local (Qwen3 MoE) |
-| RBI Researcher | On-demand | Strategy research | Free API (NVIDIA 70B) |
-| RBI Backtester | On-demand | Strategy backtesting | Local (Coder 7B) |
-| RBI Implementer | On-demand | Strategy implementation | Free API (NVIDIA 70B) |
-| Risk Manager | Every 5min | Portfolio risk assessment | Paid API (Claude) |
-| Polymarket Analyst | Every 30min | Prediction market arbitrage | Free API (NVIDIA 70B) |
+| Stream Observer | Sentinel | Continuous | Local (3B) |
+| Signal Classifier | Sentinel | Continuous | Local (3B) |
+| Liquidation Detector | Sentinel | Continuous | Local (3B) |
+| Sentiment Analyzer | Strategist | Every 15min | Local (Qwen3 MoE) |
+| Anomaly Hunter | Strategist | Every 4h | Local (Qwen3 MoE) |
+| RBI Researcher | Coder | On-demand | Free API (NVIDIA 70B) |
+| RBI Backtester | Coder | On-demand | Local (Coder 7B) |
+| RBI Implementer | Coder | On-demand | Free API (NVIDIA 70B) |
+| Risk Manager | Queen | Every 5min | Paid API (Claude) |
+| Polymarket Analyst | Queen | Every 30min | Free API (NVIDIA 70B) |
 
 ## Cost Estimate
 
@@ -170,9 +206,9 @@ For a moderate trading setup (~7,000 inference calls/day):
 
 | Tier | Monthly Cost | Tasks |
 |------|-------------|-------|
-| Local GPU (Ollama/vLLM) | $0 | ~5,500 calls (signals, liquidations, streams) |
-| Free APIs (NVIDIA/Grok) | $0 | ~1,200 calls (research, summaries, implementation) |
-| Paid APIs (Claude/Grok Pro) | ~$5-20 | ~300 calls (risk assessment only) |
+| Local GPU (4x 1070 Ti) | $0 | ~5,500 calls |
+| Free APIs (NVIDIA/Grok) | $0 | ~1,200 calls |
+| Paid APIs (Claude/Grok Pro) | ~$5-20 | ~300 calls (risk only) |
 
 **Total: ~$5-20/month** (electricity not included)
 
