@@ -50,6 +50,18 @@
           }
         },
         "description": "Fleet of GPU nodes for distributed inference."
+      },
+      "dashboardPort": {
+        "type": "number",
+        "description": "Port for the dashboard web server. Default: 3939."
+      },
+      "mode": {
+        "type": "string",
+        "description": "local = run agents on this machine. remote = laptop control mode (proxy to Queen). auto = detect."
+      },
+      "remoteQueenHost": {
+        "type": "string",
+        "description": "IP of the Queen node for remote mode. Used when controlling the fleet from a laptop."
       }
     }
   }

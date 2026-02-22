@@ -14,6 +14,7 @@ import { resolveGpuProfile, modelsForVram } from "./gpu-profiles.js";
 import { FleetManager, DEFAULT_FLEET_CONFIG, type FleetConfig } from "./fleet-manager.js";
 import { QueenOrchestrator } from "./queen-orchestrator.js";
 import { startDashboardServer } from "./dashboard-server.js";
+import { RemoteFleetClient, discoverQueenNode } from "./remote-client.js";
 
 type PluginCfg = {
   gpuVramMb?: number;
@@ -26,6 +27,10 @@ type PluginCfg = {
   tradingMode?: boolean;
   fleetNodes?: FleetConfig["nodes"];
   dashboardPort?: number;
+  /** Set to the Queen node IP when running from your laptop (no local GPU). */
+  remoteQueenHost?: string;
+  /** "local" = this machine runs agents. "remote" = this is a laptop/control node. "auto" = detect. */
+  mode?: "local" | "remote" | "auto";
 };
 
 function buildRouterConfig(cfg: PluginCfg): RouterConfig {
@@ -82,6 +87,12 @@ export function createApexClawTool(api: OpenClawPluginApi) {
       const action = String(params.action ?? "status");
       const pluginCfg = (api.pluginConfig ?? {}) as PluginCfg;
       const routerConfig = buildRouterConfig(pluginCfg);
+
+      // --- Remote mode: proxy everything to the Queen node ---
+      const isRemote = pluginCfg.mode === "remote" || (pluginCfg.mode !== "local" && pluginCfg.remoteQueenHost);
+      if (isRemote) {
+        return handleRemoteAction(action, params, pluginCfg);
+      }
 
       switch (action) {
         case "route": {
@@ -314,4 +325,152 @@ export function createApexClawTool(api: OpenClawPluginApi) {
       }
     },
   };
+}
+
+/**
+ * Handle actions in remote mode (running from laptop, proxying to Queen node).
+ */
+async function handleRemoteAction(
+  action: string,
+  params: Record<string, unknown>,
+  cfg: PluginCfg,
+): Promise<{ content: Array<{ type: string; text: string }> }> {
+  const dashPort = cfg.dashboardPort ?? 3939;
+  let queenHost = cfg.remoteQueenHost;
+
+  // Auto-discover if no host configured
+  if (!queenHost) {
+    queenHost = await discoverQueenNode(dashPort);
+    if (!queenHost) {
+      return {
+        content: [{
+          type: "text",
+          text: [
+            "Could not find the Queen node on the network.",
+            "",
+            "Either:",
+            '  1. Set "remoteQueenHost" in the plugin config to the Queen machine\'s IP',
+            "  2. Make sure the orchestrator is running on the Queen node (run action:start there first)",
+            "",
+            "Example laptop config in openclaw.json:",
+            JSON.stringify({
+              plugins: {
+                "apexclaw-gpu-optimizer": {
+                  mode: "remote",
+                  remoteQueenHost: "192.168.1.102",
+                  dashboardPort: 3939,
+                },
+              },
+            }, null, 2),
+          ].join("\n"),
+        }],
+      };
+    }
+  }
+
+  const client = new RemoteFleetClient({ queenHost, dashboardPort: dashPort, timeoutMs: 10000 });
+  const dashUrl = client.getDashboardUrl();
+
+  switch (action) {
+    case "status": {
+      try {
+        const snapshot = await client.getSnapshot();
+        return {
+          content: [{
+            type: "text",
+            text: `Connected to Queen at ${dashUrl}\n\n${JSON.stringify(snapshot, null, 2)}`,
+          }],
+        };
+      } catch (err) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to reach Queen at ${dashUrl}: ${err}\n\nMake sure the orchestrator is running on the Queen node.`,
+          }],
+        };
+      }
+    }
+
+    case "dashboard": {
+      const reachable = await client.ping();
+      return {
+        content: [{
+          type: "text",
+          text: reachable
+            ? `Dashboard: ${dashUrl}\n\nOpen this URL in your browser to monitor and control the fleet.`
+            : `Queen node at ${dashUrl} is not responding.\nMake sure the orchestrator is running on that machine.`,
+        }],
+      };
+    }
+
+    case "agents": {
+      try {
+        const agents = await client.getAgents();
+        return { content: [{ type: "text", text: JSON.stringify(agents, null, 2) }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `Failed: ${err}` }] };
+      }
+    }
+
+    case "start": {
+      return {
+        content: [{
+          type: "text",
+          text: [
+            "You're in remote mode (laptop). The orchestrator must be started on the Queen node itself.",
+            "",
+            "SSH into your Queen machine and run:",
+            `  ssh ${queenHost}`,
+            "  openclaw  # then use apexclaw-trade action:start",
+            "",
+            "Or start it directly:",
+            `  ssh ${queenHost} 'cd /path/to/openclaw && nohup node start-apexclaw.js &'`,
+            "",
+            `Once running, control it from here or open ${dashUrl} in your browser.`,
+          ].join("\n"),
+        }],
+      };
+    }
+
+    case "stop":
+    case "pause": {
+      try {
+        const result = await client.sendCommand(action === "stop" ? "pause" : action);
+        return { content: [{ type: "text", text: `Sent ${action} to Queen at ${dashUrl}\n${JSON.stringify(result)}` }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `Failed to send ${action}: ${err}` }] };
+      }
+    }
+
+    case "emergency-stop": {
+      try {
+        const result = await client.emergencyStop(String(params.prompt ?? "Emergency stop from laptop"));
+        return { content: [{ type: "text", text: `EMERGENCY STOP sent to ${dashUrl}\n${JSON.stringify(result)}` }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `Failed to send emergency stop: ${err}` }] };
+      }
+    }
+
+    case "rbi-start": {
+      try {
+        const result = await client.startRbi(String(params.prompt ?? "Manual research trigger"));
+        return { content: [{ type: "text", text: `RBI pipeline started on Queen\n${JSON.stringify(result)}` }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `Failed: ${err}` }] };
+      }
+    }
+
+    default:
+      return {
+        content: [{
+          type: "text",
+          text: [
+            `Remote mode — action "${action}" not proxied.`,
+            "",
+            "Available remote actions: status, dashboard, agents, pause, stop, emergency-stop, rbi-start",
+            `Or open ${dashUrl} in your browser for the full dashboard.`,
+          ].join("\n"),
+        }],
+      };
+  }
 }

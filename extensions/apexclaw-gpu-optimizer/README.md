@@ -179,6 +179,63 @@ Key vLLM flags for 8GB VRAM:
 Used only for critical risk assessment and complex reasoning.
 Set `ANTHROPIC_API_KEY` in your environment.
 
+## Laptop Remote Control
+
+Control your fleet from a laptop without any GPU. The laptop connects to the Queen node's dashboard over your LAN.
+
+```
+  ┌──────────────┐         ┌──────────────────┐    ┌──────────────────┐
+  │   LAPTOP     │  HTTP   │ Node 1: Sentinel │    │ Node 2: Queen    │
+  │  (no GPU)    │────────▶│ + Strategist     │    │ + Coder          │
+  │              │    │    │                  │    │                  │
+  │ OpenClaw CLI │    │    │ Qwen 3B + MoE    │    │ Dashboard :3939  │
+  │ or Browser   │    │    └──────────────────┘    └──────────────────┘
+  └──────────────┘    │                                     ▲
+                      └─────────────────────────────────────┘
+                              All commands proxy to Queen
+```
+
+### Laptop Setup
+
+1. Install OpenClaw on your laptop (no GPU or Ollama needed)
+2. Copy `laptop.config.example.json` to your OpenClaw config:
+
+```bash
+cp laptop.config.example.json ~/.openclaw/config.json
+```
+
+3. Edit `remoteQueenHost` to match your Queen node's IP:
+
+```json
+{
+  "plugins": {
+    "apexclaw-gpu-optimizer": {
+      "mode": "remote",
+      "remoteQueenHost": "192.168.1.102",
+      "dashboardPort": 3939
+    }
+  }
+}
+```
+
+4. Start the fleet on the GPU machines first, then control from your laptop:
+
+```bash
+# From laptop — all commands proxy to the Queen node
+apexclaw-trade action:status        # fleet + agent snapshot
+apexclaw-trade action:dashboard     # get dashboard URL to open in browser
+apexclaw-trade action:pause         # pause all trading
+apexclaw-trade action:resume        # resume trading
+apexclaw-trade action:emergency-stop reason:"market crash"
+apexclaw-trade action:rbi-start hypothesis:"BTC liquidation cascade"
+```
+
+5. Or just open `http://<queen-ip>:3939` in your browser for the full dashboard.
+
+### Auto-Discovery
+
+If you don't know the Queen's IP, set `remoteQueenHost` to `"auto"`. The client will scan `192.168.1.100-110` for a responding dashboard server.
+
 ## Configuration
 
 See `apexclaw.config.example.json` for both 2-node and 4-node configs.
