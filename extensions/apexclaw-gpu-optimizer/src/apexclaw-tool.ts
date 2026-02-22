@@ -1,8 +1,9 @@
 /**
  * ApexClaw GPU-optimized trading tool for OpenClaw.
  *
- * Exposes the tiered model router and trading agent system as an
- * OpenClaw tool that can be invoked from the agent/chat interface.
+ * Exposes the tiered model router, 4-node fleet orchestrator, and trading
+ * agent system as an OpenClaw tool invokable from the agent/chat interface.
+ * Also starts the dashboard server on the Queen node.
  */
 
 import { Type } from "@sinclair/typebox";
@@ -11,6 +12,10 @@ import { routeTask, estimateMonthlyCost, type RouterConfig, type TradingTaskType
 import { ALL_AGENTS, getAgent } from "./trading-agents.js";
 import { resolveGpuProfile, modelsForVram } from "./gpu-profiles.js";
 import { FleetManager, DEFAULT_FLEET_CONFIG, type FleetConfig } from "./fleet-manager.js";
+import { QueenOrchestrator } from "./queen-orchestrator.js";
+import { startDashboardServer } from "./dashboard-server.js";
+import { RemoteFleetClient, discoverQueenNode } from "./remote-client.js";
+import { QwenOAuthProvider } from "./qwen-oauth-provider.js";
 
 type PluginCfg = {
   gpuVramMb?: number;
@@ -22,7 +27,17 @@ type PluginCfg = {
   maxLocalConcurrency?: number;
   tradingMode?: boolean;
   fleetNodes?: FleetConfig["nodes"];
+  dashboardPort?: number;
+  /** Set to the Queen node IP when running from your laptop (no local GPU). */
+  remoteQueenHost?: string;
+  /** "local" = this machine runs agents. "remote" = this is a laptop/control node. "auto" = detect. */
+  mode?: "local" | "remote" | "auto";
+  /** Enable Qwen OAuth for free cloud coding model (1000-2000 req/day) */
+  qwenOAuth?: boolean;
 };
+
+// Singleton for Qwen OAuth provider
+let qwenProvider: QwenOAuthProvider | null = null;
 
 function buildRouterConfig(cfg: PluginCfg): RouterConfig {
   return {
@@ -32,6 +47,7 @@ function buildRouterConfig(cfg: PluginCfg): RouterConfig {
     hasNvidiaApi: Boolean(cfg.nvidiaApiKey || process.env.NVIDIA_API_KEY),
     hasGrokApi: Boolean(cfg.grokApiKey || process.env.XAI_API_KEY || process.env.GROK_API_KEY),
     hasClaudeApi: Boolean(process.env.ANTHROPIC_API_KEY),
+    hasQwenOAuth: Boolean(cfg.qwenOAuth || process.env.QWEN_OAUTH_ENABLED || qwenProvider?.isAuthenticated()),
     forceTier: cfg.tier === "local" || cfg.tier === "free-api" || cfg.tier === "paid-api"
       ? cfg.tier
       : undefined,
@@ -41,16 +57,21 @@ function buildRouterConfig(cfg: PluginCfg): RouterConfig {
   };
 }
 
+// Singleton state for the running orchestrator
+let activeFleet: FleetManager | null = null;
+let activeOrchestrator: QueenOrchestrator | null = null;
+let activeDashboard: ReturnType<typeof startDashboardServer> | null = null;
+
 export function createApexClawTool(api: OpenClawPluginApi) {
   return {
     name: "apexclaw-trade",
     label: "ApexClaw Trading Router",
     description:
-      "GPU-optimized trading agent router. Routes tasks across local GPU models (Ollama/vLLM on 8GB GPUs), free APIs (NVIDIA NIM, Grok), and paid APIs (Claude Max). Supports RBI pipeline, liquidation detection, sentiment analysis, and risk management.",
+      "GPU-optimized trading agent router for 1-4 node fleet. Routes tasks across local GPU models (Ollama/vLLM), free APIs (Qwen OAuth, NVIDIA NIM, Grok), and paid APIs (Claude Max). Includes dashboard, RBI pipeline, liquidation detection, sentiment analysis, and risk management.",
     parameters: Type.Object({
       action: Type.String({
         description:
-          'Action: "route" (route a task), "agents" (list agents), "status" (fleet status), "gpu-info" (show GPU models), "cost-estimate" (monthly cost estimate)',
+          'Action: "route" (route a task), "agents" (list agents), "status" (fleet status), "gpu-info" (show GPU models), "cost-estimate" (monthly cost estimate), "dashboard" (start dashboard), "start" (start orchestrator), "stop" (stop orchestrator), "qwen-auth" (authenticate Qwen OAuth for free cloud coding model)',
       }),
       taskType: Type.Optional(
         Type.String({
@@ -73,6 +94,12 @@ export function createApexClawTool(api: OpenClawPluginApi) {
       const action = String(params.action ?? "status");
       const pluginCfg = (api.pluginConfig ?? {}) as PluginCfg;
       const routerConfig = buildRouterConfig(pluginCfg);
+
+      // --- Remote mode: proxy everything to the Queen node ---
+      const isRemote = pluginCfg.mode === "remote" || (pluginCfg.mode !== "local" && pluginCfg.remoteQueenHost);
+      if (isRemote) {
+        return handleRemoteAction(action, params, pluginCfg);
+      }
 
       switch (action) {
         case "route": {
@@ -130,10 +157,22 @@ export function createApexClawTool(api: OpenClawPluginApi) {
         }
 
         case "status": {
+          if (activeOrchestrator) {
+            const snapshot = activeOrchestrator.getSnapshot();
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify(snapshot, null, 2),
+              }],
+            };
+          }
+
+          // No orchestrator running — do a quick fleet probe
           const fleetConfig: FleetConfig = {
             nodes: pluginCfg.fleetNodes ?? DEFAULT_FLEET_CONFIG.nodes,
-            healthCheckIntervalMs: 30000,
+            healthCheckIntervalMs: 15000,
             healthCheckTimeoutMs: 5000,
+            dashboardPort: pluginCfg.dashboardPort ?? 3939,
           };
           const fleet = new FleetManager(fleetConfig);
           await fleet.checkAllHealth();
@@ -145,6 +184,7 @@ export function createApexClawTool(api: OpenClawPluginApi) {
             content: [{
               type: "text",
               text: JSON.stringify({
+                orchestratorRunning: false,
                 gpuProfile: {
                   name: gpuProfile.name,
                   vramMb: gpuProfile.vramMb,
@@ -160,6 +200,82 @@ export function createApexClawTool(api: OpenClawPluginApi) {
                   vllm: routerConfig.localVllmUrl,
                 },
               }, null, 2),
+            }],
+          };
+        }
+
+        case "start": {
+          if (activeOrchestrator) {
+            return { content: [{ type: "text", text: "Orchestrator already running." }] };
+          }
+
+          const fc: FleetConfig = {
+            nodes: pluginCfg.fleetNodes ?? DEFAULT_FLEET_CONFIG.nodes,
+            healthCheckIntervalMs: 15000,
+            healthCheckTimeoutMs: 5000,
+            dashboardPort: pluginCfg.dashboardPort ?? 3939,
+          };
+          activeFleet = new FleetManager(fc);
+          // Find the MoE node's Ollama URL for local embeddings
+          const moeNode = fc.nodes.find((n) => n.hasCustomQwen) ?? fc.nodes[0];
+          activeOrchestrator = new QueenOrchestrator(
+            activeFleet,
+            // Local embeddings config (nomic-embed-text on CPU via Ollama)
+            moeNode ? {
+              ollamaUrl: `http://${moeNode.host}:${moeNode.ollamaPort}`,
+              model: "nomic-embed-text:v1.5",
+              maxCacheEntries: 500_000,
+            } : undefined,
+            // API optimizer config
+            {
+              cacheTtlMs: 60_000,
+              endpoints: moeNode ? {
+                ollama: `http://${moeNode.host}:${moeNode.ollamaPort}`,
+                vllm: `http://${moeNode.host}:${moeNode.vllmPort}/v1`,
+              } : undefined,
+            },
+          );
+          await activeOrchestrator.start();
+
+          const dashPort = pluginCfg.dashboardPort ?? 3939;
+          activeDashboard = startDashboardServer(activeOrchestrator, activeFleet, {
+            port: dashPort,
+            host: "0.0.0.0",
+          });
+
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                status: "started",
+                dashboard: `http://localhost:${dashPort}`,
+                fleet: activeFleet.getStatus(),
+              }, null, 2),
+            }],
+          };
+        }
+
+        case "stop": {
+          if (!activeOrchestrator) {
+            return { content: [{ type: "text", text: "Orchestrator not running." }] };
+          }
+          activeOrchestrator.stop();
+          activeDashboard?.close();
+          activeOrchestrator = null;
+          activeFleet = null;
+          activeDashboard = null;
+          return { content: [{ type: "text", text: "Orchestrator and dashboard stopped." }] };
+        }
+
+        case "dashboard": {
+          if (!activeOrchestrator || !activeFleet) {
+            return { content: [{ type: "text", text: "Start the orchestrator first with action: start" }] };
+          }
+          const dp = pluginCfg.dashboardPort ?? 3939;
+          return {
+            content: [{
+              type: "text",
+              text: `Dashboard running at http://localhost:${dp}\n\nOpen in your browser to see:\n- Fleet status (scales 1-4 nodes)\n- Agent status and routing decisions\n- RBI pipeline progress\n- Embedding cache stats (local nomic-embed-text)\n- API optimizer stats (dedup, cache hit rate, queuing)\n- Signal dedup rate\n- Real-time event stream\n- Cost tracking across tiers`,
             }],
           };
         }
@@ -224,14 +340,234 @@ export function createApexClawTool(api: OpenClawPluginApi) {
           };
         }
 
+        case "qwen-auth": {
+          if (!qwenProvider) {
+            qwenProvider = new QwenOAuthProvider();
+          }
+
+          // Try to load existing credentials first
+          const alreadyAuth = await qwenProvider.initialize();
+          if (alreadyAuth) {
+            const stats = qwenProvider.getStats();
+            return {
+              content: [{
+                type: "text",
+                text: [
+                  "Qwen OAuth: Already authenticated!",
+                  "",
+                  `Remaining today: ${stats.remainingDaily} / ${950} requests`,
+                  `Token expires: ${stats.tokenExpiresAt ? new Date(stats.tokenExpiresAt * 1000).toISOString() : "unknown"}`,
+                  "",
+                  "Qwen cloud models (qwen3-coder-plus, qwen3-max) will be used",
+                  "for code gen tasks (RBI research, backtest, implement) in the free-api tier.",
+                  "",
+                  'Set QWEN_OAUTH_ENABLED=1 or "qwenOAuth": true in your config to enable.',
+                ].join("\n"),
+              }],
+            };
+          }
+
+          // Need to run Device Flow
+          const result = await qwenProvider.authenticate();
+          if (result.success) {
+            return {
+              content: [{
+                type: "text",
+                text: [
+                  "Qwen OAuth: Authenticated successfully!",
+                  "",
+                  "Credentials saved to ~/.qwen/oauth_creds.json",
+                  "(shared with Qwen Code CLI — tokens auto-refresh)",
+                  "",
+                  "Free tier: 1,000-2,000 requests/day, 60/min",
+                  "Models: qwen3-coder-plus, qwen3-coder-flash, qwen3-max",
+                  "",
+                  "Code gen tasks will now route to Qwen cloud instead of NVIDIA/local.",
+                ].join("\n"),
+              }],
+            };
+          }
+
+          return {
+            content: [{
+              type: "text",
+              text: [
+                "Qwen OAuth: Authentication required.",
+                "",
+                result.verificationUrl
+                  ? `Open this URL in your browser: ${result.verificationUrl}`
+                  : "Open https://chat.qwen.ai to authorize.",
+                result.userCode ? `Enter code: ${result.userCode}` : "",
+                "",
+                "After authorizing, run this action again.",
+                "",
+                "Or authenticate via the Qwen Code CLI first:",
+                "  npm install -g @qwen-code/qwen-code",
+                "  qwen  # follow browser auth prompt",
+                "",
+                "The token at ~/.qwen/oauth_creds.json is shared — auth once, use everywhere.",
+                result.error ? `\nError: ${result.error}` : "",
+              ].filter(Boolean).join("\n"),
+            }],
+          };
+        }
+
         default:
           return {
             content: [{
               type: "text",
-              text: `Unknown action "${action}". Available: route, agents, status, gpu-info, cost-estimate`,
+              text: `Unknown action "${action}". Available: start, stop, status, dashboard, route, agents, gpu-info, cost-estimate, qwen-auth`,
             }],
           };
       }
     },
   };
+}
+
+/**
+ * Handle actions in remote mode (running from laptop, proxying to Queen node).
+ */
+async function handleRemoteAction(
+  action: string,
+  params: Record<string, unknown>,
+  cfg: PluginCfg,
+): Promise<{ content: Array<{ type: string; text: string }> }> {
+  const dashPort = cfg.dashboardPort ?? 3939;
+  let queenHost = cfg.remoteQueenHost;
+
+  // Auto-discover if no host configured
+  if (!queenHost) {
+    queenHost = await discoverQueenNode(dashPort);
+    if (!queenHost) {
+      return {
+        content: [{
+          type: "text",
+          text: [
+            "Could not find the Queen node on the network.",
+            "",
+            "Either:",
+            '  1. Set "remoteQueenHost" in the plugin config to the Queen machine\'s IP',
+            "  2. Make sure the orchestrator is running on the Queen node (run action:start there first)",
+            "",
+            "Example laptop config in openclaw.json:",
+            JSON.stringify({
+              plugins: {
+                "apexclaw-gpu-optimizer": {
+                  mode: "remote",
+                  remoteQueenHost: "192.168.1.102",
+                  dashboardPort: 3939,
+                },
+              },
+            }, null, 2),
+          ].join("\n"),
+        }],
+      };
+    }
+  }
+
+  const client = new RemoteFleetClient({ queenHost, dashboardPort: dashPort, timeoutMs: 10000 });
+  const dashUrl = client.getDashboardUrl();
+
+  switch (action) {
+    case "status": {
+      try {
+        const snapshot = await client.getSnapshot();
+        return {
+          content: [{
+            type: "text",
+            text: `Connected to Queen at ${dashUrl}\n\n${JSON.stringify(snapshot, null, 2)}`,
+          }],
+        };
+      } catch (err) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to reach Queen at ${dashUrl}: ${err}\n\nMake sure the orchestrator is running on the Queen node.`,
+          }],
+        };
+      }
+    }
+
+    case "dashboard": {
+      const reachable = await client.ping();
+      return {
+        content: [{
+          type: "text",
+          text: reachable
+            ? `Dashboard: ${dashUrl}\n\nOpen this URL in your browser to monitor and control the fleet.`
+            : `Queen node at ${dashUrl} is not responding.\nMake sure the orchestrator is running on that machine.`,
+        }],
+      };
+    }
+
+    case "agents": {
+      try {
+        const agents = await client.getAgents();
+        return { content: [{ type: "text", text: JSON.stringify(agents, null, 2) }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `Failed: ${err}` }] };
+      }
+    }
+
+    case "start": {
+      return {
+        content: [{
+          type: "text",
+          text: [
+            "You're in remote mode (laptop). The orchestrator must be started on the Queen node itself.",
+            "",
+            "SSH into your Queen machine and run:",
+            `  ssh ${queenHost}`,
+            "  openclaw  # then use apexclaw-trade action:start",
+            "",
+            "Or start it directly:",
+            `  ssh ${queenHost} 'cd /path/to/openclaw && nohup node start-apexclaw.js &'`,
+            "",
+            `Once running, control it from here or open ${dashUrl} in your browser.`,
+          ].join("\n"),
+        }],
+      };
+    }
+
+    case "stop":
+    case "pause": {
+      try {
+        const result = await client.sendCommand(action === "stop" ? "pause" : action);
+        return { content: [{ type: "text", text: `Sent ${action} to Queen at ${dashUrl}\n${JSON.stringify(result)}` }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `Failed to send ${action}: ${err}` }] };
+      }
+    }
+
+    case "emergency-stop": {
+      try {
+        const result = await client.emergencyStop(String(params.prompt ?? "Emergency stop from laptop"));
+        return { content: [{ type: "text", text: `EMERGENCY STOP sent to ${dashUrl}\n${JSON.stringify(result)}` }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `Failed to send emergency stop: ${err}` }] };
+      }
+    }
+
+    case "rbi-start": {
+      try {
+        const result = await client.startRbi(String(params.prompt ?? "Manual research trigger"));
+        return { content: [{ type: "text", text: `RBI pipeline started on Queen\n${JSON.stringify(result)}` }] };
+      } catch (err) {
+        return { content: [{ type: "text", text: `Failed: ${err}` }] };
+      }
+    }
+
+    default:
+      return {
+        content: [{
+          type: "text",
+          text: [
+            `Remote mode — action "${action}" not proxied.`,
+            "",
+            "Available remote actions: status, dashboard, agents, pause, stop, emergency-stop, rbi-start",
+            `Or open ${dashUrl} in your browser for the full dashboard.`,
+          ].join("\n"),
+        }],
+      };
+  }
 }

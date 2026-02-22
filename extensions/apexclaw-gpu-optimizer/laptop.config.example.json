@@ -1,0 +1,13 @@
+{
+  "$schema": "openclaw-config",
+  "_comment": "Laptop config — controls the ApexClaw fleet remotely. No GPU needed on this machine.",
+  "_comment2": "Change remoteQueenHost to the IP of whichever machine runs the dashboard (isDashboardHost: true).",
+
+  "plugins": {
+    "apexclaw-gpu-optimizer": {
+      "mode": "remote",
+      "remoteQueenHost": "192.168.1.102",
+      "dashboardPort": 3939
+    }
+  }
+}

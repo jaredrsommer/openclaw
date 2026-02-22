@@ -14,6 +14,10 @@ import type { TradingTaskType } from "./tiered-router.js";
 export type AgentTemplate = {
   id: string;
   name: string;
+  /** User-customizable display name (shown in dashboard) */
+  customName?: string;
+  /** Short avatar/icon for dashboard (emoji or 1-2 chars) */
+  avatar: string;
   description: string;
   /** Primary task type for routing */
   taskType: TradingTaskType;
@@ -27,6 +31,26 @@ export type AgentTemplate = {
   preferredNodeRole: "fast" | "general" | "reasoning" | "any";
 };
 
+/** Get the display name for an agent (customName > name) */
+export function getAgentDisplayName(agent: AgentTemplate): string {
+  return agent.customName ?? agent.name;
+}
+
+/** Set a custom name for an agent at runtime */
+export function setAgentCustomName(agentId: string, customName: string): boolean {
+  const agent = ALL_AGENTS.find((a) => a.id === agentId);
+  if (!agent) return false;
+  agent.customName = customName;
+  return true;
+}
+
+/** Agent display name + avatar lookup by ID */
+export function getAgentDisplay(agentId: string): { name: string; avatar: string } {
+  const agent = ALL_AGENTS.find((a) => a.id === agentId);
+  if (!agent) return { name: agentId, avatar: "?" };
+  return { name: agent.customName ?? agent.name, avatar: agent.avatar };
+}
+
 /**
  * Stream Observer Agent
  * Watches live data feeds (price, volume, order book, social) and emits
@@ -35,6 +59,7 @@ export type AgentTemplate = {
 export const STREAM_OBSERVER: AgentTemplate = {
   id: "stream-observer",
   name: "Stream Observer",
+  avatar: "EY",
   description: "Monitors live market data streams and emits structured observations",
   taskType: "stream-observation",
   mode: "continuous",
@@ -67,6 +92,7 @@ Never explain your reasoning — only output the JSON.`,
 export const SIGNAL_CLASSIFIER: AgentTemplate = {
   id: "signal-classifier",
   name: "Signal Classifier",
+  avatar: "SC",
   description: "Classifies raw market observations into actionable trading signals",
   taskType: "signal-classification",
   mode: "continuous",
@@ -98,6 +124,7 @@ Respond ONLY with JSON. No text. Minimize tokens.`,
 export const LIQUIDATION_DETECTOR: AgentTemplate = {
   id: "liquidation-detector",
   name: "Liquidation Detector",
+  avatar: "LD",
   description: "Detects impending liquidations on Hyperliquid for sniping opportunities",
   taskType: "liquidation-detection",
   mode: "continuous",
@@ -133,6 +160,7 @@ Speed is paramount. JSON only. No explanations.`,
 export const RBI_RESEARCHER: AgentTemplate = {
   id: "rbi-researcher",
   name: "RBI Researcher",
+  avatar: "RR",
   description: "Research phase: discovers and analyzes potential trading strategies",
   taskType: "rbi-research",
   mode: "on-demand",
@@ -179,6 +207,7 @@ Output (JSON):
 export const RBI_BACKTESTER: AgentTemplate = {
   id: "rbi-backtester",
   name: "RBI Backtester",
+  avatar: "BT",
   description: "Backtest phase: generates and evaluates strategy backtests",
   taskType: "rbi-backtest",
   mode: "on-demand",
@@ -217,6 +246,7 @@ Output (JSON):
 export const RBI_IMPLEMENTER: AgentTemplate = {
   id: "rbi-implementer",
   name: "RBI Implementer",
+  avatar: "IM",
   description: "Implement phase: converts backtested strategies into live execution code",
   taskType: "rbi-implement",
   mode: "on-demand",
@@ -252,6 +282,7 @@ Never bypass risk checks. Always include emergency stop logic.`,
 export const RISK_MANAGER: AgentTemplate = {
   id: "risk-manager",
   name: "Risk Manager",
+  avatar: "RM",
   description: "Evaluates portfolio-level risk and enforces position limits",
   taskType: "risk-assessment",
   mode: "scheduled",
@@ -294,6 +325,7 @@ EMERGENCY_STOP halts all trading — use only in crisis conditions.`,
 export const SENTIMENT_ANALYZER: AgentTemplate = {
   id: "sentiment-analyzer",
   name: "Sentiment Analyzer",
+  avatar: "SA",
   description: "Analyzes market sentiment from social media, news, and on-chain data",
   taskType: "sentiment-analysis",
   mode: "scheduled",
@@ -330,6 +362,7 @@ Output (JSON):
 export const POLYMARKET_ANALYST: AgentTemplate = {
   id: "polymarket-analyst",
   name: "Polymarket Analyst",
+  avatar: "PM",
   description: "Identifies information arbitrage opportunities on prediction markets",
   taskType: "polymarket-analysis",
   mode: "scheduled",
@@ -369,6 +402,7 @@ Output (JSON):
 export const ANOMALY_HUNTER: AgentTemplate = {
   id: "anomaly-hunter",
   name: "Anomaly Hunter",
+  avatar: "AH",
   description: "Simons-style statistical anomaly detection in market microstructure",
   taskType: "anomaly-detection",
   mode: "scheduled",

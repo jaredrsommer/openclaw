@@ -1,18 +1,29 @@
 /**
  * Tiered model router for ApexClaw.
  *
- * Routes inference requests across three tiers based on task complexity,
+ * Routes inference requests across four tiers based on task complexity,
  * cost sensitivity, and latency requirements:
  *
- *   Tier 1 (Local GPU) → Ollama/vLLM on 1070 Ti — free, ~2-10 tok/s
- *   Tier 2 (Free APIs)  → NVIDIA NIM, Grok free — free, ~30-80 tok/s
- *   Tier 3 (Paid APIs)  → Claude Max, Grok Pro  — paid, ~60-120 tok/s
+ *   Tier 1 (Local Fast)  → Ollama/vLLM on 1070 Ti — free, ~2-10 tok/s, 3B-7B models
+ *   Tier 2 (Local Large) → AirLLM on 1070 Ti — free, ~1-3 tok/s, 70B+ models
+ *   Tier 3 (Free APIs)   → Qwen OAuth, NVIDIA NIM, Grok free — free, ~30-80 tok/s
+ *   Tier 4 (Paid APIs)   → Claude Max, Grok Pro — paid, ~60-120 tok/s
  *
- * Trading-specific routing prioritizes speed for time-sensitive decisions
- * (liquidation sniping, order execution) and cost for background analysis.
+ * AirLLM (github.com/jaredrsommer/airllm) enables 70B+ models on 8GB VRAM
+ * by loading one transformer layer at a time. With 128GB RAM on the MoE
+ * machine, layers prefetch from RAM (no disk bottleneck).
+ *
+ * Routing priority for background complex tasks:
+ *   airllm 70B local (free, best quality) > free APIs > paid APIs
+ *
+ * Routing priority for realtime/urgent tasks:
+ *   local fast (Ollama 3B) > free APIs > airllm (too slow)
+ *
+ * Qwen OAuth (qwen3-coder-plus) is preferred for code gen tasks in the
+ * free-api tier — 1,000-2,000 free requests/day from your Qwen account.
  */
 
-export type InferenceTier = "local" | "free-api" | "paid-api";
+export type InferenceTier = "local" | "local-large" | "free-api" | "paid-api";
 
 export type TaskComplexity = "trivial" | "simple" | "moderate" | "complex" | "critical";
 
@@ -49,6 +60,12 @@ export type RouterConfig = {
   hasNvidiaApi: boolean;
   hasGrokApi: boolean;
   hasClaudeApi: boolean;
+  /** Qwen OAuth authenticated (qwen3-coder-plus, 1000-2000 free/day) */
+  hasQwenOAuth: boolean;
+  /** AirLLM server running (70B+ models via layer-by-layer inference) */
+  hasAirLLM: boolean;
+  /** URL of the airllm-server.py process */
+  airllmUrl: string;
   forceTier?: InferenceTier;
   maxLocalConcurrency: number;
   currentLocalLoad: number;
@@ -78,7 +95,30 @@ export const TIER_PROVIDERS = {
       },
     },
   },
+  "local-large": {
+    airllm: {
+      // AirLLM: 70B+ models on 8GB VRAM via layer-by-layer inference
+      // Slow (~1-3 tok/s with 4bit) but free and highest quality locally
+      // 128GB RAM on MoE machine = fast layer prefetch from RAM
+      models: {
+        reasoning: "meta-llama/Llama-3.1-70B-Instruct",
+        code: "Qwen/Qwen2.5-72B-Instruct",
+        moe: "mistralai/Mixtral-8x7B-Instruct-v0.1",
+        nuclear: "meta-llama/Llama-3.1-405B-Instruct",
+      },
+    },
+  },
   "free-api": {
+    qwen: {
+      // Qwen OAuth free tier (1,000-2,000 req/day via qwen.ai account)
+      // Preferred for code gen tasks — best free coding model available
+      models: {
+        code: "qwen3-coder-plus",
+        codeFast: "qwen3-coder-flash",
+        general: "qwen3-max",
+        latest: "qwen-plus-latest",
+      },
+    },
     nvidia: {
       // NVIDIA NIM free tier
       models: {
@@ -138,8 +178,8 @@ const TRADING_ROUTES: Record<TradingTaskType, {
   "market-summary": {
     complexity: "moderate",
     urgency: "background",
-    preferredTier: "free-api",
-    reason: "Longer context summaries benefit from 70B NVIDIA NIM models",
+    preferredTier: "local-large",
+    reason: "70B model for deep market summaries (airllm local, or free API fallback)",
   },
   "risk-assessment": {
     complexity: "complex",
@@ -162,8 +202,8 @@ const TRADING_ROUTES: Record<TradingTaskType, {
   "rbi-research": {
     complexity: "complex",
     urgency: "background",
-    preferredTier: "free-api",
-    reason: "Research phase uses large context NVIDIA NIM models for free",
+    preferredTier: "local-large",
+    reason: "Research phase uses 70B model locally via airllm (free, highest quality)",
   },
   "rbi-backtest": {
     complexity: "moderate",
@@ -174,8 +214,8 @@ const TRADING_ROUTES: Record<TradingTaskType, {
   "rbi-implement": {
     complexity: "complex",
     urgency: "normal",
-    preferredTier: "free-api",
-    reason: "Implementation needs larger models, NVIDIA NIM 70B for free",
+    preferredTier: "local-large",
+    reason: "Implementation with Qwen 72B locally via airllm (free, best code quality)",
   },
   "stream-observation": {
     complexity: "simple",
@@ -192,8 +232,8 @@ const TRADING_ROUTES: Record<TradingTaskType, {
   "polymarket-analysis": {
     complexity: "complex",
     urgency: "normal",
-    preferredTier: "free-api",
-    reason: "Information arbitrage analysis on NVIDIA 70B models",
+    preferredTier: "local-large",
+    reason: "Deep information arbitrage analysis on local 70B via airllm",
   },
   general: {
     complexity: "simple",
@@ -235,9 +275,27 @@ function selectTier(
     return "local";
   }
 
+  // AirLLM: 70B+ models locally — best for background complex tasks
+  if (preferred === "local-large") {
+    if (config.hasAirLLM) {
+      return "local-large";
+    }
+    // AirLLM not available — fall through to free API, then local
+    if (config.hasNvidiaApi || config.hasGrokApi || config.hasQwenOAuth) {
+      return "free-api";
+    }
+    if (config.currentLocalLoad < config.maxLocalConcurrency) {
+      return "local";
+    }
+    return config.hasClaudeApi ? "paid-api" : "local";
+  }
+
   if (preferred === "free-api") {
-    if (!config.hasNvidiaApi && !config.hasGrokApi) {
-      // No free APIs configured — try local, then paid
+    if (!config.hasNvidiaApi && !config.hasGrokApi && !config.hasQwenOAuth) {
+      // No free APIs — try airllm for complex tasks, then local
+      if (config.hasAirLLM && route.complexity === "complex") {
+        return "local-large";
+      }
       if (config.currentLocalLoad < config.maxLocalConcurrency) {
         return "local";
       }
@@ -249,6 +307,10 @@ function selectTier(
   // paid-api: only if configured
   if (preferred === "paid-api") {
     if (!config.hasClaudeApi && !config.hasGrokApi) {
+      // No paid APIs — try airllm for complex tasks, then free, then local
+      if (config.hasAirLLM && route.complexity === "complex") {
+        return "local-large";
+      }
       return config.hasNvidiaApi ? "free-api" : "local";
     }
     return "paid-api";
@@ -266,6 +328,8 @@ function resolveProviderForTier(
   switch (tier) {
     case "local":
       return resolveLocalProvider(taskType, route, config);
+    case "local-large":
+      return resolveAirLLMProvider(taskType, route, config);
     case "free-api":
       return resolveFreeApiProvider(taskType, route, config);
     case "paid-api":
@@ -321,12 +385,92 @@ function resolveLocalProvider(
   };
 }
 
+/** Task types that benefit from AirLLM's 70B code model (Qwen 72B) */
+const AIRLLM_CODE_TASKS: TradingTaskType[] = [
+  "rbi-backtest", "rbi-implement",
+];
+
+/** Task types that benefit from AirLLM's 70B reasoning model (Llama 70B) */
+const AIRLLM_REASONING_TASKS: TradingTaskType[] = [
+  "rbi-research", "risk-assessment", "polymarket-analysis", "market-summary",
+];
+
+function resolveAirLLMProvider(
+  taskType: TradingTaskType,
+  route: (typeof TRADING_ROUTES)[TradingTaskType],
+  config: RouterConfig,
+): RouteDecision {
+  if (!config.hasAirLLM) {
+    // AirLLM not available — fall back to free API
+    return resolveFreeApiProvider(taskType, route, config);
+  }
+
+  // Select model based on task type
+  let model: string;
+  let reason: string;
+
+  if (AIRLLM_CODE_TASKS.includes(taskType)) {
+    model = TIER_PROVIDERS["local-large"].airllm.models.code;
+    reason = `AirLLM local: Qwen 72B for ${taskType} (free, layer-by-layer on 8GB VRAM)`;
+  } else if (AIRLLM_REASONING_TASKS.includes(taskType)) {
+    model = TIER_PROVIDERS["local-large"].airllm.models.reasoning;
+    reason = `AirLLM local: Llama 70B for ${taskType} (free, layer-by-layer on 8GB VRAM)`;
+  } else {
+    // Default to Mixtral MoE for general tasks (faster than dense 70B)
+    model = TIER_PROVIDERS["local-large"].airllm.models.moe;
+    reason = `AirLLM local: Mixtral MoE for ${taskType} (free, faster sparse model)`;
+  }
+
+  return {
+    tier: "local-large",
+    provider: "airllm",
+    model,
+    reason,
+    estimatedCostUsd: 0,
+    // AirLLM is slow: ~1-3 tok/s with 4bit, ~60-180s for 200 token response
+    estimatedLatencyMs: 120_000,
+  };
+}
+
+/** Code-related task types that benefit from Qwen's coding model */
+const CODE_TASKS: TradingTaskType[] = [
+  "rbi-research", "rbi-backtest", "rbi-implement",
+];
+
 function resolveFreeApiProvider(
   taskType: TradingTaskType,
   route: (typeof TRADING_ROUTES)[TradingTaskType],
   config: RouterConfig,
 ): RouteDecision {
-  // Prefer NVIDIA NIM for larger context tasks
+  // Prefer Qwen OAuth for code-related tasks (best free coding model)
+  // qwen3-coder-plus: 1,000-2,000 free req/day via OAuth
+  if (config.hasQwenOAuth && CODE_TASKS.includes(taskType)) {
+    const needsFast = route.urgency === "realtime" || route.urgency === "urgent";
+    return {
+      tier: "free-api",
+      provider: "qwen",
+      model: needsFast
+        ? TIER_PROVIDERS["free-api"].qwen.models.codeFast
+        : TIER_PROVIDERS["free-api"].qwen.models.code,
+      reason: `Qwen OAuth free: ${route.reason}`,
+      estimatedCostUsd: 0,
+      estimatedLatencyMs: needsFast ? 600 : 1500,
+    };
+  }
+
+  // Qwen OAuth for general tasks when NVIDIA isn't available
+  if (config.hasQwenOAuth && !config.hasNvidiaApi) {
+    return {
+      tier: "free-api",
+      provider: "qwen",
+      model: TIER_PROVIDERS["free-api"].qwen.models.general,
+      reason: `Qwen OAuth free: ${route.reason}`,
+      estimatedCostUsd: 0,
+      estimatedLatencyMs: 1500,
+    };
+  }
+
+  // NVIDIA NIM for larger context / general tasks
   if (config.hasNvidiaApi) {
     const needsFast = route.urgency === "realtime" || route.urgency === "urgent";
     const model = needsFast
@@ -343,13 +487,25 @@ function resolveFreeApiProvider(
     };
   }
 
-  // Fall back to Grok free tier
+  // Grok free tier
   if (config.hasGrokApi) {
     return {
       tier: "free-api",
       provider: "grok",
       model: TIER_PROVIDERS["free-api"].grok.models.general,
       reason: `Grok free tier: ${route.reason}`,
+      estimatedCostUsd: 0,
+      estimatedLatencyMs: 1500,
+    };
+  }
+
+  // Qwen OAuth as last free resort (even for non-code tasks)
+  if (config.hasQwenOAuth) {
+    return {
+      tier: "free-api",
+      provider: "qwen",
+      model: TIER_PROVIDERS["free-api"].qwen.models.latest,
+      reason: `Qwen OAuth free (fallback): ${route.reason}`,
       estimatedCostUsd: 0,
       estimatedLatencyMs: 1500,
     };
@@ -405,6 +561,7 @@ export function estimateMonthlyCost(
 ): { totalUsd: number; breakdown: Record<InferenceTier, number> } {
   const breakdown: Record<InferenceTier, number> = {
     local: 0,
+    "local-large": 0,
     "free-api": 0,
     "paid-api": 0,
   };
@@ -416,7 +573,7 @@ export function estimateMonthlyCost(
   }
 
   return {
-    totalUsd: breakdown.local + breakdown["free-api"] + breakdown["paid-api"],
+    totalUsd: breakdown.local + breakdown["local-large"] + breakdown["free-api"] + breakdown["paid-api"],
     breakdown,
   };
 }

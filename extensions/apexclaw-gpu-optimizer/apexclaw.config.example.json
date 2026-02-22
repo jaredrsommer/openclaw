@@ -1,6 +1,8 @@
 {
   "$schema": "openclaw-config",
-  "_comment": "ApexClaw sample config for a 3-node GTX 1070 Ti fleet with Claude Max + Grok + NVIDIA NIM free tier",
+  "_comment_1": "ApexClaw config for GTX 1070 Ti fleet + Claude Max + Grok + NVIDIA NIM",
+  "_comment_2": "Start with 1-2 nodes. Add machines later — just update fleetNodes and restart.",
+  "_comment_3": "The MoE machine (128GB DDR4, Ryzen 5900X) is always the anchor node.",
 
   "models": {
     "providers": {
@@ -8,6 +10,7 @@
         "baseUrl": "http://127.0.0.1:11434/v1",
         "api": "ollama",
         "apiKey": "OLLAMA_API_KEY",
+        "_comment": "On the MoE machine, Ollama runs Qwen 3B on CPU (vLLM has the GPU). On other nodes, Ollama uses the GPU.",
         "models": [
           {
             "id": "qwen2.5:3b-instruct-q5_K_M",
@@ -52,6 +55,7 @@
         "baseUrl": "http://127.0.0.1:8000/v1",
         "api": "openai-completions",
         "apiKey": "VLLM_API_KEY",
+        "_comment": "Custom Qwen3 MoE runs ONLY on the MoE machine via vLLM. Other nodes don't need this.",
         "models": [
           {
             "id": "custom-qwen3-moe-trading",
@@ -69,6 +73,7 @@
         "baseUrl": "https://integrate.api.nvidia.com/v1",
         "api": "openai-completions",
         "apiKey": "NVIDIA_API_KEY",
+        "_comment": "Free tier. Handles: RBI research, RBI implement, polymarket, market summaries. No GPU needed.",
         "models": [
           {
             "id": "nvidia/llama-3.1-nemotron-70b-instruct",
@@ -115,15 +120,6 @@
             "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
           },
           {
-            "id": "grok-2-mini",
-            "name": "Grok 2 Mini (Fast)",
-            "reasoning": false,
-            "input": ["text"],
-            "contextWindow": 131072,
-            "maxTokens": 4096,
-            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
-          },
-          {
             "id": "grok-3",
             "name": "Grok 3 (Reasoning)",
             "reasoning": true,
@@ -140,41 +136,178 @@
   "plugins": {
     "apexclaw-gpu-optimizer": {
       "gpuVramMb": 8192,
-      "localOllamaUrl": "http://127.0.0.1:11434",
-      "localVllmUrl": "http://127.0.0.1:8000/v1",
       "tradingMode": true,
-      "maxLocalConcurrency": 1,
+      "maxLocalConcurrency": 2,
       "tier": "auto",
+      "dashboardPort": 3939,
+      "qwenOAuth": true,
+      "_comment_qwen": "Free 1000-2000 req/day via Qwen OAuth. Run 'apexclaw-trade action:qwen-auth' to set up.",
+
+      "_comment_howto": [
+        "Pick ONE fleetNodes config below based on how many GPU machines you have.",
+        "Copy the appropriate array into the 'fleetNodes' field.",
+        "The MoE machine (128GB/5900X) is always node-1-moe.",
+        "Change host IPs to match your LAN."
+      ],
+
+      "_comment_active": "=== 2-NODE STARTER (recommended) ===",
       "fleetNodes": [
         {
-          "id": "node-1-fast",
+          "id": "node-1-moe",
+          "name": "MoE (Strategist+Queen)",
           "host": "192.168.1.101",
           "ollamaPort": 11434,
           "vllmPort": 8000,
           "gpuVramMb": 8192,
-          "role": "fast",
-          "hasCustomQwen": false,
-          "maxConcurrency": 1
+          "role": "strategist",
+          "hasCustomQwen": true,
+          "maxConcurrency": 2,
+          "_comment": "128GB DDR4, Ryzen 5900X. GPU=vLLM(MoE), CPU=Ollama(3B). Backtesting runs here.",
+          "assignedAgents": [
+            "sentiment-analyzer", "anomaly-hunter",
+            "stream-observer", "signal-classifier", "liquidation-detector",
+            "rbi-backtester",
+            "risk-manager", "polymarket-analyst"
+          ],
+          "isDashboardHost": true
         },
         {
-          "id": "node-2-trading",
+          "id": "node-2-coder",
+          "name": "Coder",
           "host": "192.168.1.102",
           "ollamaPort": 11434,
           "vllmPort": 8000,
           "gpuVramMb": 8192,
-          "role": "general",
+          "role": "coder",
+          "hasCustomQwen": false,
+          "maxConcurrency": 1,
+          "_comment": "Runs Qwen Coder 7B + DeepSeek R1 7B on GPU via Ollama",
+          "assignedAgents": ["rbi-researcher", "rbi-implementer"],
+          "isDashboardHost": false
+        }
+      ],
+
+      "_1node_comment": "=== 1-NODE (MoE machine only — APIs handle everything else) ===",
+      "_1node_fleetNodes": [
+        {
+          "id": "node-1-moe",
+          "name": "MoE (All-in-One)",
+          "host": "192.168.1.101",
+          "ollamaPort": 11434,
+          "vllmPort": 8000,
+          "gpuVramMb": 8192,
+          "role": "strategist",
           "hasCustomQwen": true,
-          "maxConcurrency": 1
+          "maxConcurrency": 2,
+          "assignedAgents": [
+            "sentiment-analyzer", "anomaly-hunter",
+            "stream-observer", "signal-classifier", "liquidation-detector",
+            "rbi-backtester",
+            "risk-manager", "polymarket-analyst", "rbi-researcher", "rbi-implementer"
+          ],
+          "isDashboardHost": true
+        }
+      ],
+
+      "_3node_comment": "=== 3-NODE (MoE + Coder + Sentinel) ===",
+      "_3node_fleetNodes": [
+        {
+          "id": "node-1-moe",
+          "name": "MoE (Strategist+Queen)",
+          "host": "192.168.1.101",
+          "ollamaPort": 11434,
+          "vllmPort": 8000,
+          "gpuVramMb": 8192,
+          "role": "strategist",
+          "hasCustomQwen": true,
+          "maxConcurrency": 2,
+          "assignedAgents": [
+            "sentiment-analyzer", "anomaly-hunter", "rbi-backtester",
+            "risk-manager", "polymarket-analyst"
+          ],
+          "isDashboardHost": true
         },
         {
-          "id": "node-3-reasoning",
+          "id": "node-2-coder",
+          "name": "Coder",
+          "host": "192.168.1.102",
+          "ollamaPort": 11434,
+          "vllmPort": 8000,
+          "gpuVramMb": 8192,
+          "role": "coder",
+          "hasCustomQwen": false,
+          "maxConcurrency": 1,
+          "assignedAgents": ["rbi-researcher", "rbi-implementer"],
+          "isDashboardHost": false
+        },
+        {
+          "id": "node-3-sentinel",
+          "name": "Sentinel",
           "host": "192.168.1.103",
           "ollamaPort": 11434,
           "vllmPort": 8000,
           "gpuVramMb": 8192,
-          "role": "reasoning",
+          "role": "sentinel",
           "hasCustomQwen": false,
-          "maxConcurrency": 1
+          "maxConcurrency": 2,
+          "assignedAgents": ["stream-observer", "signal-classifier", "liquidation-detector"],
+          "isDashboardHost": false
+        }
+      ],
+
+      "_4node_comment": "=== 4-NODE FULL (dedicated Queen) ===",
+      "_4node_fleetNodes": [
+        {
+          "id": "node-1-moe",
+          "name": "MoE (Strategist)",
+          "host": "192.168.1.101",
+          "ollamaPort": 11434,
+          "vllmPort": 8000,
+          "gpuVramMb": 8192,
+          "role": "strategist",
+          "hasCustomQwen": true,
+          "maxConcurrency": 2,
+          "assignedAgents": ["sentiment-analyzer", "anomaly-hunter", "rbi-backtester"],
+          "isDashboardHost": false
+        },
+        {
+          "id": "node-2-coder",
+          "name": "Coder",
+          "host": "192.168.1.102",
+          "ollamaPort": 11434,
+          "vllmPort": 8000,
+          "gpuVramMb": 8192,
+          "role": "coder",
+          "hasCustomQwen": false,
+          "maxConcurrency": 1,
+          "assignedAgents": ["rbi-researcher", "rbi-implementer"],
+          "isDashboardHost": false
+        },
+        {
+          "id": "node-3-sentinel",
+          "name": "Sentinel",
+          "host": "192.168.1.103",
+          "ollamaPort": 11434,
+          "vllmPort": 8000,
+          "gpuVramMb": 8192,
+          "role": "sentinel",
+          "hasCustomQwen": false,
+          "maxConcurrency": 2,
+          "assignedAgents": ["stream-observer", "signal-classifier", "liquidation-detector"],
+          "isDashboardHost": false
+        },
+        {
+          "id": "node-4-queen",
+          "name": "Queen",
+          "host": "192.168.1.104",
+          "ollamaPort": 11434,
+          "vllmPort": 8000,
+          "gpuVramMb": 8192,
+          "role": "queen",
+          "hasCustomQwen": false,
+          "maxConcurrency": 1,
+          "assignedAgents": ["risk-manager", "polymarket-analyst"],
+          "isDashboardHost": true
         }
       ]
     }
