@@ -11,8 +11,10 @@
  *
  * Key design decisions:
  *   - Backtesting ALWAYS runs on MoE machine (best CPU + 128GB RAM)
- *   - Risk/Polymarket/Research use paid/free APIs — no GPU needed
- *   - vLLM owns the GPU on the MoE machine; Ollama runs 3B on CPU (128GB makes this viable)
+ *   - AirLLM runs 70B+ models on MoE GPU via layer-by-layer inference (background tasks)
+ *   - vLLM owns the GPU for fast MoE inference; Ollama runs 3B on CPU
+ *   - AirLLM shares the GPU with vLLM — only used for non-realtime background tasks
+ *   - 128GB RAM = layers prefetch from RAM, no disk I/O bottleneck
  *   - Each added node frees the MoE machine to focus on trading inference
  */
 
@@ -539,6 +541,7 @@ export class FleetManager {
 
     if (!targetNode) return undefined;
 
+    const airllmUrl = process.env.AIRLLM_URL ?? "http://localhost:8787";
     const routerConfig: RouterConfig = {
       gpuVramMb: targetNode.gpuVramMb,
       localOllamaUrl: `http://${targetNode.host}:${targetNode.ollamaPort}`,
@@ -547,6 +550,8 @@ export class FleetManager {
       hasGrokApi: Boolean(process.env.XAI_API_KEY || process.env.GROK_API_KEY),
       hasClaudeApi: Boolean(process.env.ANTHROPIC_API_KEY),
       hasQwenOAuth: Boolean(process.env.QWEN_OAUTH_ENABLED),
+      hasAirLLM: Boolean(process.env.AIRLLM_ENABLED),
+      airllmUrl,
       maxLocalConcurrency: targetNode.maxConcurrency,
       currentLocalLoad: targetNode.currentLoad,
       customQwenAvailable: targetNode.hasCustomQwen,

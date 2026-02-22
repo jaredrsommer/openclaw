@@ -179,9 +179,57 @@ else
   echo "  Skipping vLLM — only needed on the MoE machine (NODE_ROLE=moe)."
 fi
 
-# --- 4. Verify GPU and models ---
+# --- 4. Set up AirLLM for 70B+ models (MoE machine only) ---
 echo ""
-echo "[4/5] Verifying setup..."
+echo "[4/6] Setting up AirLLM (70B+ models on 8GB VRAM)..."
+
+if [ "${NODE_ROLE}" = "moe" ]; then
+  AIRLLM_PORT="${AIRLLM_PORT:-8787}"
+  AIRLLM_MODEL="${AIRLLM_MODEL:-meta-llama/Llama-3.1-70B-Instruct}"
+  AIRLLM_COMPRESSION="${AIRLLM_COMPRESSION:-4bit}"
+  AIRLLM_LAYER_PATH="${AIRLLM_LAYER_PATH:-/tmp/airllm-layers}"
+
+  echo "  AirLLM enables 70B+ models on 8GB VRAM via layer-by-layer inference."
+  echo "  With 128GB RAM, layers prefetch from memory (no disk bottleneck)."
+  echo ""
+  echo "  Installing airllm..."
+
+  if command -v pip3 &>/dev/null; then
+    pip3 install --quiet airllm psutil 2>/dev/null && echo "  airllm installed." || echo "  WARNING: pip install failed. Try: pip3 install airllm psutil"
+  else
+    echo "  WARNING: pip3 not found. Install Python 3 and pip, then run:"
+    echo "    pip3 install airllm psutil"
+  fi
+
+  echo ""
+  echo "  To start the AirLLM inference server:"
+  echo "    python3 extensions/apexclaw-gpu-optimizer/src/airllm-server.py \\"
+  echo "      --model ${AIRLLM_MODEL} \\"
+  echo "      --compression ${AIRLLM_COMPRESSION} \\"
+  echo "      --port ${AIRLLM_PORT} \\"
+  echo "      --layer-path ${AIRLLM_LAYER_PATH}"
+  echo ""
+  echo "  NOTE: First run downloads the model (~40GB for 70B) and splits layers."
+  echo "  Subsequent runs load from the layer cache at ${AIRLLM_LAYER_PATH}."
+  echo ""
+  echo "  Supported models:"
+  echo "    meta-llama/Llama-3.1-70B-Instruct     (best reasoning)"
+  echo "    Qwen/Qwen2.5-72B-Instruct             (best code gen)"
+  echo "    mistralai/Mixtral-8x7B-Instruct-v0.1   (fast MoE)"
+  echo "    meta-llama/Llama-3.1-405B-Instruct     (nuclear option, very slow)"
+  echo ""
+  echo "  To enable in the fleet, set: AIRLLM_ENABLED=1 AIRLLM_URL=http://localhost:${AIRLLM_PORT}"
+
+  # Create layer cache directory
+  mkdir -p "${AIRLLM_LAYER_PATH}" 2>/dev/null || true
+else
+  echo "  Skipping AirLLM — only runs on the MoE machine (NODE_ROLE=moe)."
+  echo "  AirLLM needs 128GB+ RAM for efficient 70B model layer prefetching."
+fi
+
+# --- 5. Verify GPU and models ---
+echo ""
+echo "[5/6] Verifying setup..."
 
 echo "  GPU Info:"
 if command -v nvidia-smi &>/dev/null; then
@@ -218,9 +266,9 @@ if [ "${NODE_ROLE}" = "moe" ] && [ -n "${CUSTOM_QWEN_MODEL_PATH}" ]; then
   curl -s "http://127.0.0.1:${VLLM_PORT}/v1/models" > /dev/null 2>&1 && echo "  vLLM API: OK" || echo "  vLLM API: NOT RESPONDING (may still be loading model)"
 fi
 
-# --- 5. Print configuration snippet ---
+# --- 6. Print configuration snippet ---
 echo ""
-echo "[5/5] Configuration for openclaw.json:"
+echo "[6/6] Configuration for openclaw.json:"
 echo ""
 
 LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
