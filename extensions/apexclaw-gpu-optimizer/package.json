@@ -1,0 +1,15 @@
+{
+  "name": "@openclaw/apexclaw-gpu-optimizer",
+  "version": "2026.2.22",
+  "private": true,
+  "description": "ApexClaw GPU-optimized trading agent framework for low-end GPUs (8GB VRAM)",
+  "type": "module",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "devDependencies": {
+    "openclaw": "workspace:*"
+  }
+}

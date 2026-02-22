@@ -1,0 +1,56 @@
+{
+  "id": "apexclaw-gpu-optimizer",
+  "name": "ApexClaw GPU Optimizer",
+  "description": "Multi-tier model routing optimized for low-end GPUs (8GB VRAM). Routes tasks across local models (Ollama/vLLM), free APIs (NVIDIA NIM, Grok), and paid APIs (Claude, Grok Pro) based on task complexity and cost.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "gpuVramMb": {
+        "type": "number",
+        "description": "Available GPU VRAM in MB. Default: 8192 (8GB for GTX 1070 Ti)."
+      },
+      "localOllamaUrl": {
+        "type": "string",
+        "description": "Ollama base URL for local GPU inference. Default: http://127.0.0.1:11434"
+      },
+      "localVllmUrl": {
+        "type": "string",
+        "description": "vLLM base URL for custom Qwen3 MoE. Default: http://127.0.0.1:8000/v1"
+      },
+      "nvidiaApiKey": {
+        "type": "string",
+        "description": "NVIDIA NIM API key (free tier)."
+      },
+      "grokApiKey": {
+        "type": "string",
+        "description": "Grok/xAI API key."
+      },
+      "tier": {
+        "type": "string",
+        "description": "Force a specific tier: local, free-api, paid-api, or auto (default)."
+      },
+      "maxLocalConcurrency": {
+        "type": "number",
+        "description": "Max concurrent local model inferences. Default: 1 for 8GB VRAM."
+      },
+      "tradingMode": {
+        "type": "boolean",
+        "description": "Enable trading-specific agent templates and RBI pipeline routing."
+      },
+      "fleetNodes": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "host": { "type": "string" },
+            "port": { "type": "number" },
+            "gpuVramMb": { "type": "number" },
+            "role": { "type": "string" }
+          }
+        },
+        "description": "Fleet of GPU nodes for distributed inference."
+      }
+    }
+  }
+}
