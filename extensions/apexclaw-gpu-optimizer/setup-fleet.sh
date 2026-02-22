@@ -188,6 +188,8 @@ if [ "${NODE_ROLE}" = "moe" ]; then
   AIRLLM_MODEL="${AIRLLM_MODEL:-meta-llama/Llama-3.1-70B-Instruct}"
   AIRLLM_COMPRESSION="${AIRLLM_COMPRESSION:-4bit}"
   AIRLLM_LAYER_PATH="${AIRLLM_LAYER_PATH:-/tmp/airllm-layers}"
+  AIRLLM_RAMDISK="${AIRLLM_RAMDISK:-1}"
+  AIRLLM_RAMDISK_SIZE="${AIRLLM_RAMDISK_SIZE:-60G}"
 
   echo "  AirLLM enables 70B+ models on 8GB VRAM via layer-by-layer inference."
   echo "  With 128GB RAM, layers prefetch from memory (no disk bottleneck)."
@@ -201,6 +203,43 @@ if [ "${NODE_ROLE}" = "moe" ]; then
     echo "    pip3 install airllm psutil"
   fi
 
+  # Ramdisk setup for layer cache — 5-10x faster than NVMe
+  # 128GB DDR4 = ~40-50 GB/s bandwidth vs NVMe ~3-7 GB/s
+  # This is the single biggest speedup for airllm on high-RAM machines
+  echo ""
+  if [ "${AIRLLM_RAMDISK}" = "1" ]; then
+    RAMDISK_PATH="/mnt/airllm-ramdisk"
+    echo "  Setting up ramdisk for layer cache (${AIRLLM_RAMDISK_SIZE} tmpfs)..."
+    echo "  DDR4 bandwidth: ~40-50 GB/s vs NVMe ~3-7 GB/s = ~5-10x speedup"
+
+    if mountpoint -q "${RAMDISK_PATH}" 2>/dev/null; then
+      echo "  Ramdisk already mounted at ${RAMDISK_PATH}."
+    else
+      sudo mkdir -p "${RAMDISK_PATH}" 2>/dev/null || true
+      if sudo mount -t tmpfs -o size="${AIRLLM_RAMDISK_SIZE}" tmpfs "${RAMDISK_PATH}" 2>/dev/null; then
+        echo "  Ramdisk mounted: ${RAMDISK_PATH} (${AIRLLM_RAMDISK_SIZE})"
+        # Update layer path to use ramdisk
+        AIRLLM_LAYER_PATH="${RAMDISK_PATH}"
+      else
+        echo "  WARNING: Failed to mount ramdisk. Falling back to ${AIRLLM_LAYER_PATH}."
+        echo "  You can mount manually: sudo mount -t tmpfs -o size=${AIRLLM_RAMDISK_SIZE} tmpfs ${RAMDISK_PATH}"
+      fi
+    fi
+
+    # Add fstab entry for persistence across reboots
+    if ! grep -q "airllm-ramdisk" /etc/fstab 2>/dev/null; then
+      echo ""
+      echo "  To persist ramdisk across reboots, add to /etc/fstab:"
+      echo "    tmpfs ${RAMDISK_PATH} tmpfs size=${AIRLLM_RAMDISK_SIZE},noatime 0 0"
+      echo ""
+      echo "  NOTE: Layer cache in ramdisk is lost on reboot. First inference"
+      echo "  after reboot re-splits layers (~5min for 70B). After that, fast."
+    fi
+  else
+    echo "  Ramdisk disabled (AIRLLM_RAMDISK=0). Using disk path: ${AIRLLM_LAYER_PATH}"
+    echo "  Enable ramdisk for 5-10x speedup: AIRLLM_RAMDISK=1"
+  fi
+
   echo ""
   echo "  To start the AirLLM inference server:"
   echo "    python3 extensions/apexclaw-gpu-optimizer/src/airllm-server.py \\"
@@ -211,6 +250,13 @@ if [ "${NODE_ROLE}" = "moe" ]; then
   echo ""
   echo "  NOTE: First run downloads the model (~40GB for 70B) and splits layers."
   echo "  Subsequent runs load from the layer cache at ${AIRLLM_LAYER_PATH}."
+  echo ""
+  echo "  Performance estimates (GTX 1070 Ti, 4bit compression):"
+  echo "    Ramdisk (tmpfs):  ~2-5 sec/token  (150 tokens ≈ 5-12 min)"
+  echo "    NVMe SSD:         ~10-12 sec/token (150 tokens ≈ 25-30 min)"
+  echo "    SATA SSD:         ~20+ sec/token   (not recommended)"
+  echo ""
+  echo "  Best for background analysis tasks — use free-api tier for time-sensitive work."
   echo ""
   echo "  Supported models:"
   echo "    meta-llama/Llama-3.1-70B-Instruct     (best reasoning)"

@@ -15,6 +15,7 @@
  *   GET /api/bus/topic/:topic → Messages for a specific topic
  *   GET /api/bus/agent/:id → Messages from/to a specific agent
  *   POST /api/command  → Send orchestrator commands (pause, resume, emergency-stop, rbi-start)
+ *   GET /api/airllm/health → AirLLM server health (model, GPU, ramdisk status)
  *   GET /api/events    → SSE real-time event stream (fleet + agent comms)
  */
 
@@ -23,6 +24,7 @@ import { type QueenOrchestrator } from "./queen-orchestrator.js";
 import { type FleetManager } from "./fleet-manager.js";
 import { DASHBOARD_HTML } from "./dashboard-ui.js";
 import { ALL_AGENTS, getAgentDisplay, setAgentCustomName } from "./trading-agents.js";
+import { AirLLMProvider } from "./airllm-provider.js";
 
 export type DashboardConfig = {
   port: number;
@@ -110,6 +112,30 @@ export function startDashboardServer(
     if (url.pathname === "/api/fleet" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(fleet.getStatus()));
+      return;
+    }
+
+    // --- AirLLM health ---
+    if (url.pathname === "/api/airllm/health" && req.method === "GET") {
+      const airllmUrl = process.env.AIRLLM_URL ?? "http://localhost:8787";
+      if (!process.env.AIRLLM_ENABLED) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "AirLLM not enabled" }));
+        return;
+      }
+      const airllm = new AirLLMProvider({ serverUrl: airllmUrl });
+      airllm.getHealth().then((health) => {
+        if (health) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(health));
+        } else {
+          res.writeHead(503, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "AirLLM server not reachable" }));
+        }
+      }).catch(() => {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "AirLLM server not reachable" }));
+      });
       return;
     }
 

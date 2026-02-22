@@ -163,6 +163,45 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
   <div class="stat-box"><div class="stat-label">Risk Level</div><div class="stat-value" id="stat-risk">--</div></div>
 </div>
 
+<!-- AirLLM Status (shown when airllm is enabled) -->
+<div id="airllm-section" style="display:none">
+<div class="section-title">AirLLM Local Inference (70B+ on 8GB VRAM)</div>
+<div class="grid" style="grid-template-columns: 1fr 1fr 1fr 1fr; padding-top: 0;">
+  <div class="card">
+    <div class="card-title">Model</div>
+    <div id="airllm-model" style="font-size:14px;font-weight:700;margin-top:6px;word-break:break-all">--</div>
+    <div id="airllm-compression" style="font-size:11px;color:var(--dim);margin-top:4px">--</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Performance</div>
+    <div style="margin-top:6px">
+      <div class="node-stat"><span class="label">Requests</span><span id="airllm-requests">0</span></div>
+      <div class="node-stat"><span class="label">Tokens</span><span id="airllm-tokens">0</span></div>
+      <div class="node-stat"><span class="label">Avg tok/s</span><span id="airllm-tokps">--</span></div>
+      <div class="node-stat"><span class="label">Uptime</span><span id="airllm-uptime">--</span></div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">GPU</div>
+    <div style="margin-top:6px">
+      <div class="node-stat"><span class="label">Device</span><span id="airllm-gpu-name">--</span></div>
+      <div class="node-stat"><span class="label">Compute</span><span id="airllm-gpu-cap">--</span></div>
+      <div class="node-stat"><span class="label">VRAM Used</span><span id="airllm-gpu-vram">--</span></div>
+      <div class="node-stat"><span class="label">Peak VRAM</span><span id="airllm-gpu-peak">--</span></div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">Layer Cache</div>
+    <div style="margin-top:6px">
+      <div class="node-stat"><span class="label">Path</span><span id="airllm-cache-path" style="font-size:10px">--</span></div>
+      <div class="node-stat"><span class="label">Ramdisk</span><span id="airllm-ramdisk">--</span></div>
+      <div class="node-stat"><span class="label">RAM Total</span><span id="airllm-ram-total">--</span></div>
+      <div class="node-stat"><span class="label">RAM Free</span><span id="airllm-ram-free">--</span></div>
+    </div>
+  </div>
+</div>
+</div>
+
 <!-- Fleet nodes -->
 <div class="section-title">Fleet Nodes (4x GTX 1070 Ti)</div>
 <div class="grid" id="nodes-grid">
@@ -652,6 +691,47 @@ function renderBusStats() {
   // Also update agent list with latest state
   renderCommsAgents();
 }
+
+// --- AirLLM Health ---
+function pollAirLLMHealth() {
+  fetch('/api/airllm/health').then(r => {
+    if (!r.ok) { document.getElementById('airllm-section').style.display = 'none'; return null; }
+    return r.json();
+  }).then(h => {
+    if (!h) return;
+    document.getElementById('airllm-section').style.display = '';
+    document.getElementById('airllm-model').textContent = h.model || 'No model loaded';
+    document.getElementById('airllm-compression').textContent = h.loaded
+      ? (h.compression || 'none') + ' compression'
+      : 'Not loaded';
+    document.getElementById('airllm-requests').textContent = (h.totalRequests || 0).toLocaleString();
+    document.getElementById('airllm-tokens').textContent = (h.totalTokensGenerated || 0).toLocaleString();
+    document.getElementById('airllm-tokps').textContent = h.totalRequests > 0 ? '--' : '--';
+    document.getElementById('airllm-uptime').textContent = h.uptimeS > 0 ? formatUptime(h.uptimeS * 1000) : '--';
+
+    const gpu = h.gpu || {};
+    document.getElementById('airllm-gpu-name').textContent = gpu.deviceName || '--';
+    document.getElementById('airllm-gpu-cap').textContent = gpu.computeCapability || '--';
+    document.getElementById('airllm-gpu-vram').textContent = gpu.allocatedMb ? gpu.allocatedMb + ' MB' : '--';
+    document.getElementById('airllm-gpu-peak').textContent = gpu.maxAllocatedMb ? gpu.maxAllocatedMb + ' MB' : '--';
+
+    document.getElementById('airllm-cache-path').textContent = h.layerCachePath || '--';
+    const rdEl = document.getElementById('airllm-ramdisk');
+    if (h.layerCacheRamdisk) {
+      rdEl.innerHTML = '<span style="color:var(--green)">tmpfs (fast)</span>';
+    } else {
+      rdEl.innerHTML = '<span style="color:var(--yellow)">disk (slow)</span>';
+    }
+
+    const ram = h.ram || {};
+    document.getElementById('airllm-ram-total').textContent = ram.totalGb ? ram.totalGb + ' GB' : '--';
+    document.getElementById('airllm-ram-free').textContent = ram.availableGb ? ram.availableGb + ' GB' : '--';
+  }).catch(() => { document.getElementById('airllm-section').style.display = 'none'; });
+}
+
+// Poll AirLLM health every 30s
+pollAirLLMHealth();
+setInterval(pollAirLLMHealth, 30000);
 
 // Poll full state every 15s as backup to SSE
 setInterval(() => {

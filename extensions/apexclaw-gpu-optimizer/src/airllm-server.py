@@ -32,9 +32,23 @@ from typing import Optional
 # GPU memory management
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+# GTX 1070 Ti (Pascal sm_61) compatibility:
+# - No Flash Attention support (requires sm_75+ Turing)
+# - Disable TF32 (not available on Pascal anyway, but prevents warnings)
+# - Use SDPA (Scaled Dot-Product Attention) as fallback
+os.environ.setdefault("ATTN_BACKEND", "sdpa")
+
 try:
     import torch
     from airllm import AutoModel
+
+    # Verify CUDA compute capability for Pascal GPUs
+    if torch.cuda.is_available():
+        cap = torch.cuda.get_device_capability(0)
+        if cap[0] < 7:
+            print(f"[airllm] GPU compute capability: sm_{cap[0]}{cap[1]} (Pascal)")
+            print("[airllm] Flash Attention disabled — using SDPA fallback")
+            print("[airllm] This is normal for GTX 1070 Ti / 1080 Ti")
 except ImportError:
     print("ERROR: airllm not installed. Run: pip install airllm torch", file=sys.stderr)
     sys.exit(1)
@@ -185,20 +199,36 @@ class AirLLMEngine:
         parts.append("Assistant:")
         return "\n\n".join(parts)
 
+    def _is_ramdisk(self, path: str) -> bool:
+        """Check if the layer cache path is on a tmpfs (ramdisk)."""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["df", "--output=fstype", path],
+                capture_output=True, text=True, timeout=5,
+            )
+            return "tmpfs" in result.stdout
+        except Exception:
+            return False
+
     def get_stats(self) -> dict:
         gpu_mem = {}
         if torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability(0)
             gpu_mem = {
                 "allocated_mb": round(torch.cuda.memory_allocated() / 1024 / 1024),
                 "reserved_mb": round(torch.cuda.memory_reserved() / 1024 / 1024),
                 "max_allocated_mb": round(
                     torch.cuda.max_memory_allocated() / 1024 / 1024
                 ),
+                "compute_capability": f"sm_{cap[0]}{cap[1]}",
+                "device_name": torch.cuda.get_device_name(0),
             }
 
         import psutil
 
         ram = psutil.virtual_memory()
+        is_ramdisk = self._is_ramdisk(self.layer_cache_path)
 
         return {
             "model": self.model_id or None,
@@ -209,6 +239,8 @@ class AirLLMEngine:
             else 0,
             "total_requests": self.total_requests,
             "total_tokens_generated": self.total_tokens_generated,
+            "layer_cache_path": self.layer_cache_path,
+            "layer_cache_ramdisk": is_ramdisk,
             "gpu": gpu_mem,
             "ram": {
                 "total_gb": round(ram.total / 1024 / 1024 / 1024, 1),

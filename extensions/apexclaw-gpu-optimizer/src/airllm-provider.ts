@@ -80,7 +80,15 @@ type AirLLMHealth = {
   uptimeS: number;
   totalRequests: number;
   totalTokensGenerated: number;
-  gpu: { allocatedMb: number; reservedMb: number; maxAllocatedMb: number };
+  layerCachePath: string;
+  layerCacheRamdisk: boolean;
+  gpu: {
+    allocatedMb: number;
+    reservedMb: number;
+    maxAllocatedMb: number;
+    computeCapability?: string;
+    deviceName?: string;
+  };
   ram: { totalGb: number; usedGb: number; availableGb: number };
 };
 
@@ -218,10 +226,14 @@ export class AirLLMProvider {
         uptimeS: h.uptime_s,
         totalRequests: h.total_requests,
         totalTokensGenerated: h.total_tokens_generated,
+        layerCachePath: h.layer_cache_path ?? "",
+        layerCacheRamdisk: h.layer_cache_ramdisk ?? false,
         gpu: {
           allocatedMb: h.gpu?.allocated_mb ?? 0,
           reservedMb: h.gpu?.reserved_mb ?? 0,
           maxAllocatedMb: h.gpu?.max_allocated_mb ?? 0,
+          computeCapability: h.gpu?.compute_capability,
+          deviceName: h.gpu?.device_name,
         },
         ram: {
           totalGb: h.ram?.total_gb ?? 0,
